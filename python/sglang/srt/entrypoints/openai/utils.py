@@ -83,3 +83,24 @@ def process_routed_experts_from_ret(
     if not getattr(request, "return_routed_experts", False):
         return None
     return ret_item["meta_info"].get("routed_experts", None)
+
+
+def process_logits_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[List[float]]:
+    """Process raw logits from a ret item in non-streaming response.
+
+    Args:
+        ret_item: Response item containing meta_info
+        request: The original request object
+
+    Returns:
+        Raw logits (before softmax) for reranking models, or None
+    """
+    if not getattr(request, "return_logits", False):
+        return None
+    return ret_item["meta_info"].get("logits", None)

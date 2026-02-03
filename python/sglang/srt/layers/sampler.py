@@ -72,6 +72,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        return_logits: bool = False,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -86,11 +87,25 @@ class Sampler(nn.Module):
                 performs sampling in draft workers.
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
+            return_logits: If set, store the raw logits (before softmax) to logits_output
+                for reranking models.
         """
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+
+        # Save raw logits and apply mask for reranking models
+        if return_logits:
+            logits_output.raw_next_token_logits = logits.clone()
+            # Token IDs for "yes" and "no" only in Qwen tokenizer
+            YES_TOKEN_ID = 9693  # "yes"
+            NO_TOKEN_ID = 2152   # "no"
+            # Apply mask: set all logits except yes/no to -inf
+            mask = torch.full_like(logits, float('-inf'))
+            mask[:, YES_TOKEN_ID] = logits[:, YES_TOKEN_ID]
+            mask[:, NO_TOKEN_ID] = logits[:, NO_TOKEN_ID]
+            logits = mask
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling

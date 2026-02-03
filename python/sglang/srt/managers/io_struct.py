@@ -204,6 +204,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+    # Whether to return raw logits (before softmax) for reranking models
+    return_logits: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -639,6 +641,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_logits=(
+                self.return_logits[i]
+                if isinstance(self.return_logits, list)
+                else self.return_logits
+            ),
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -713,6 +720,9 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+
+    # Whether to return raw logits (before softmax) for reranking models
+    return_logits: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1006,6 +1016,11 @@ class BatchTokenIDOutput(
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    # Raw logits (before softmax) for reranking models
+    # output_logits[i] is a list of token logits dicts for request i
+    # Each dict has: {"token": str, "token_id": int, "logit": float}
+    output_logits: Optional[List[Optional[List[Dict[str, Any]]]]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1094,6 +1109,11 @@ class BatchStrOutput(
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
+
+    # Raw logits (before softmax) for reranking models
+    # output_logits[i] is a list of token logits dicts for request i
+    # Each dict has: {"token": str, "token_id": int, "logit": float}
+    output_logits: Optional[List[Optional[List[Dict[str, Any]]]]] = None
 
 
 @dataclass

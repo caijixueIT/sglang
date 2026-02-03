@@ -392,6 +392,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            output_logits=recv_obj.output_logits,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

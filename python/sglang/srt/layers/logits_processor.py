@@ -104,6 +104,11 @@ class LogitsProcessorOutput:
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    ## Part 6: Raw logits for reranking models (before softmax)
+    # The raw logits of the next tokens. shape: [#seq, vocab_size]
+    # Used by reranking models like qwen3-rerank that need raw logits
+    raw_next_token_logits: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:

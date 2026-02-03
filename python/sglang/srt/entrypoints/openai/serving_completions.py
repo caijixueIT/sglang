@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
+    process_logits_from_ret,
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
@@ -121,6 +122,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
+            return_logits=request.return_logits,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
@@ -448,9 +450,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     ),
                 )
 
-            # Handle hidden states
+            # Handle hidden states and logits
             hidden_states = process_hidden_states_from_ret(ret_item, request)
             routed_experts = process_routed_experts_from_ret(ret_item, request)
+            raw_logits = process_logits_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -465,6 +468,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                logits=raw_logits,
                 sgl_ext=(
                     SglExt(routed_experts=routed_experts) if routed_experts else None
                 ),

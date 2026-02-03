@@ -233,6 +233,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    return_logits: bool = False  # Return raw logits (before softmax) for reranking models
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -297,6 +298,14 @@ class SglExt(BaseModel):
         return {k: v for k, v in data.items() if v is not None}
 
 
+class TokenLogit(BaseModel):
+    """Raw logit and score for a single token (for reranking models)."""
+    token: str
+    token_id: int
+    logit: float
+    score: float  # Softmax normalized score
+
+
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
@@ -304,6 +313,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    logits: Optional[List[TokenLogit]] = None  # Raw logits for yes/no tokens (reranking models)
     sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
@@ -311,6 +321,8 @@ class CompletionResponseChoice(BaseModel):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.logits is None:
+            data.pop("logits", None)
         if self.sgl_ext is None:
             data.pop("sgl_ext", None)
         return data

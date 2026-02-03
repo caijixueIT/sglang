@@ -196,6 +196,29 @@ class SchedulerOutputProcessorMixin:
                             .tolist()
                         )
 
+                    # Save raw logits for reranking models (yes/no tokens only)
+                    if (
+                        req.return_logits
+                        and logits_output.raw_next_token_logits is not None
+                    ):
+                        raw_logits = logits_output.raw_next_token_logits[i].cpu()
+                        # Token IDs for "yes" and "no" only in Qwen tokenizer
+                        YES_TOKEN_ID = 9693  # "yes"
+                        NO_TOKEN_ID = 2152   # "no"
+                        logit_yes = raw_logits[YES_TOKEN_ID].item()
+                        logit_no = raw_logits[NO_TOKEN_ID].item()
+                        # Compute softmax scores with numerical stability
+                        import math
+                        max_logit = max(logit_yes, logit_no)
+                        exp_yes = math.exp(logit_yes - max_logit)
+                        exp_no = math.exp(logit_no - max_logit)
+                        score_yes = exp_yes / (exp_yes + exp_no)
+                        score_no = exp_no / (exp_yes + exp_no)
+                        req.output_logits = [
+                            {"token": "yes", "token_id": YES_TOKEN_ID, "logit": logit_yes, "score": score_yes},
+                            {"token": "no", "token_id": NO_TOKEN_ID, "logit": logit_no, "score": score_no},
+                        ]
+
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
                         try:
@@ -492,6 +515,29 @@ class SchedulerOutputProcessorMixin:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
+
+            # Save raw logits for reranking models during decode (yes/no tokens only)
+            if (
+                req.return_logits
+                and logits_output.raw_next_token_logits is not None
+            ):
+                raw_logits = logits_output.raw_next_token_logits[i].cpu()
+                # Token IDs for "yes" and "no" only in Qwen tokenizer
+                YES_TOKEN_ID = 9693  # "yes"
+                NO_TOKEN_ID = 2152   # "no"
+                logit_yes = raw_logits[YES_TOKEN_ID].item()
+                logit_no = raw_logits[NO_TOKEN_ID].item()
+                # Compute softmax scores with numerical stability
+                import math
+                max_logit = max(logit_yes, logit_no)
+                exp_yes = math.exp(logit_yes - max_logit)
+                exp_no = math.exp(logit_no - max_logit)
+                score_yes = exp_yes / (exp_yes + exp_no)
+                score_no = exp_no / (exp_yes + exp_no)
+                req.output_logits = [
+                    {"token": "yes", "token_id": YES_TOKEN_ID, "logit": logit_yes, "score": score_yes},
+                    {"token": "no", "token_id": NO_TOKEN_ID, "logit": logit_no, "score": score_no},
+                ]
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -899,6 +945,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_load()
         routed_experts = None
+        output_logits = None
         customized_info = {}
 
         queue_times = []
@@ -1098,6 +1145,10 @@ class SchedulerOutputProcessorMixin:
                     if routed_experts is None:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
+                if req.return_logits:
+                    if output_logits is None:
+                        output_logits = []
+                    output_logits.append(req.output_logits)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1153,6 +1204,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    output_logits=output_logits,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

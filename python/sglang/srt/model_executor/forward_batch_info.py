@@ -375,6 +375,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For raw logits (reranking models)
+    return_logits: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -419,6 +422,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            return_logits=batch.return_logits,
         )
         device = model_runner.device
 

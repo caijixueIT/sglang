@@ -530,6 +530,7 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_logits: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -735,6 +736,9 @@ class Req:
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        # Raw logits for reranking models
+        self.return_logits = return_logits
+        self.output_logits: Optional[List[Dict[str, Any]]] = None  # Token logits dicts
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -1354,6 +1358,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    # Whether to return raw logits (reranking models)
+    return_logits: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1402,6 +1409,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_logits=any(req.return_logits for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_staging_reqs=dllm_staging_reqs,
@@ -2256,6 +2264,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            return_logits=self.return_logits,
         )
 
     def copy(self):
@@ -2437,6 +2446,9 @@ class ModelWorkerBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For raw logits (reranking models)
+    return_logits: bool = False
 
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
