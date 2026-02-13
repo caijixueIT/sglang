@@ -408,51 +408,99 @@ class MooncakeKVManager(CommonKVManager):
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
-        supporting generic M-to-N TP size configurations.
+        supporting all TP configurations including cases where TP > total_kv_heads.
 
-        NOTE: This implementation calls the transfer engine for each token slot within
-        each page to ensure correctness for any page_size and head-slicing configuration.
-        This may introduce performance overhead (increased TTFT) for long sequences.
+        Supports 8 scenarios:
+        (1) prefill_tp == decode_tp <= kv_heads
+        (2) prefill_tp == decode_tp >= kv_heads
+        (3) prefill_tp <= decode_tp <= kv_heads
+        (4) prefill_tp <= kv_heads <= decode_tp
+        (5) kv_heads <= prefill_tp <= decode_tp
+        (6) decode_tp <= prefill_tp <= kv_heads
+        (7) decode_tp <= kv_heads <= prefill_tp
+        (8) kv_heads <= decode_tp <= prefill_tp
         """
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
+        src_heads_per_rank = self.kv_args.kv_head_num
         page_size = self.kv_args.page_size
 
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * self.attn_tp_size // dst_attn_tp_size
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
-        )
-
-        # Determine slicing parameters based on TP configuration
-        if self.attn_tp_size > dst_attn_tp_size:
-            # Send KVCache from multiple prefill instances to 1 decode instance
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+        # Get total KV heads from kv_args (set from model config)
+        if hasattr(self.kv_args, 'total_kv_heads') and self.kv_args.total_kv_heads:
+            total_kv_heads = self.kv_args.total_kv_heads
         else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            src_head_start_offset = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
+            # Fallback for compatibility (may be incorrect when prefill_tp > kv_heads)
+            total_kv_heads = src_heads_per_rank * self.attn_tp_size
+            logger.warning(
+                f"total_kv_heads not set in kv_args, using fallback: {total_kv_heads}. "
+                "This may cause incorrect KV transfer when prefill TP > KV heads."
+            )
+
+        prefill_tp = self.attn_tp_size
+        decode_tp = dst_attn_tp_size
+
+        # Calculate replication factors (how many ranks share the same head)
+        prefill_replicate = max(1, prefill_tp // total_kv_heads)
+        decode_replicate = max(1, decode_tp // total_kv_heads)
+
+        # Calculate per-rank heads on decode side
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp)
+
+        # Calculate global head range for current prefill rank
+        if prefill_tp <= total_kv_heads:
+            # Normal case: each prefill rank has unique heads
+            src_global_head_start = local_tp_rank_in_group * src_heads_per_rank
+            src_global_head_end = src_global_head_start + src_heads_per_rank
+        else:
+            # Replication case: multiple prefill ranks share the same head
+            # Only one rank in each replication group should send
+            if local_tp_rank_in_group % prefill_replicate != 0:
+                # This rank is a replica, skip sending
+                return 0
+            head_idx = local_tp_rank_in_group // prefill_replicate
+            src_global_head_start = head_idx
+            src_global_head_end = head_idx + 1
+
+        # Calculate global head range for target decode rank
+        if decode_tp <= total_kv_heads:
+            # Normal case: each decode rank has unique heads
+            dst_global_head_start = dst_tp_rank_in_group * dst_heads_per_rank
+            dst_global_head_end = dst_global_head_start + dst_heads_per_rank
+        else:
+            # Replication case: multiple decode ranks share the same head
+            head_idx = dst_tp_rank_in_group // decode_replicate
+            dst_global_head_start = head_idx
+            dst_global_head_end = head_idx + 1
+
+        # Calculate intersection of head ranges
+        overlap_start = max(src_global_head_start, dst_global_head_start)
+        overlap_end = min(src_global_head_end, dst_global_head_end)
+
+        if overlap_start >= overlap_end:
+            # No overlap, nothing to transfer
+            return 0
+
+        num_heads_to_send = overlap_end - overlap_start
+
+        # Calculate offsets within the per-rank buffers
+        src_head_start_offset = overlap_start - src_global_head_start
+        dst_head_start_offset = overlap_start - dst_global_head_start
+
+        # Calculate bytes per head slice
+        bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
             self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
-        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
-        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
-        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice
+        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
 
-        # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
-        # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
+        # Sanity check: The data sub-slice to be sent should fit into the dst buffer
         if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
             logger.error(
                 f"[{mooncake_session_id}] slice size ({heads_bytes_per_token_to_send}) exceeds "
@@ -460,9 +508,10 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1)
-        tokens_per_page = np.arange(page_size, dtype=np.int32).reshape(1, -1)
+        # Use int64 to avoid overflow when computing 64-bit memory addresses
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
         src_token_slot_offsets = (

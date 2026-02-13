@@ -31,7 +31,8 @@ class KVArgs:
     gpu_id: int
     # for different tp
     decode_tp_size: int
-    kv_head_num: int
+    kv_head_num: int  # per-rank KV heads (may include replicas when TP > total_kv_heads)
+    total_kv_heads: int  # total KV heads in model (not per-rank), for cross-TP transfer
     page_size: int
     # for pp prefill
     prefill_pp_size: int

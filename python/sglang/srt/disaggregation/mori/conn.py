@@ -537,7 +537,11 @@ class MoriKVManager(CommonKVManager):
         )
         return statuses
 
-    def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+    def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> Optional[TPSliceConfig]:
+        """
+        Build TP slice config supporting all TP configurations including TP > total_kv_heads.
+        Returns None if this rank should skip sending (replica rank).
+        """
         page_size = self.kv_args.page_size
 
         src_item_len = self.kv_args.kv_item_lens[0]
@@ -546,30 +550,64 @@ class MoriKVManager(CommonKVManager):
         bytes_per_token_src = src_item_len // page_size
         bytes_per_token_dst = dst_item_len // page_size
 
-        prefill_tp_size = self.attn_tp_size
-        decode_tp_size = peer_info.decode_tp_size
+        prefill_tp = self.attn_tp_size
+        decode_tp = peer_info.decode_tp_size
 
-        num_kv_heads = self.kv_args.kv_head_num
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
-        if dst_heads_per_rank == 0:
-            raise ValueError("Destination heads per rank evaluates to zero")
+        src_heads_per_rank = self.kv_args.kv_head_num
+
+        # Get total KV heads from kv_args
+        if hasattr(self.kv_args, 'total_kv_heads') and self.kv_args.total_kv_heads:
+            total_kv_heads = self.kv_args.total_kv_heads
+        else:
+            total_kv_heads = src_heads_per_rank * prefill_tp
+            logger.warning(
+                f"total_kv_heads not set in kv_args, using fallback: {total_kv_heads}"
+            )
+
+        # Calculate replication factors
+        prefill_replicate = max(1, prefill_tp // total_kv_heads)
+        decode_replicate = max(1, decode_tp // total_kv_heads)
+
+        # Calculate per-rank heads on decode side
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp)
+
+        local_tp_rank = self.kv_args.engine_rank % prefill_tp
+        dst_tp_rank = peer_info.decode_tp_rank % decode_tp
+
+        # Calculate global head range for current prefill rank
+        if prefill_tp <= total_kv_heads:
+            src_global_head_start = local_tp_rank * src_heads_per_rank
+            src_global_head_end = src_global_head_start + src_heads_per_rank
+        else:
+            if local_tp_rank % prefill_replicate != 0:
+                return None  # Skip replica ranks
+            head_idx = local_tp_rank // prefill_replicate
+            src_global_head_start = head_idx
+            src_global_head_end = head_idx + 1
+
+        # Calculate global head range for target decode rank
+        if decode_tp <= total_kv_heads:
+            dst_global_head_start = dst_tp_rank * dst_heads_per_rank
+            dst_global_head_end = dst_global_head_start + dst_heads_per_rank
+        else:
+            head_idx = dst_tp_rank // decode_replicate
+            dst_global_head_start = head_idx
+            dst_global_head_end = head_idx + 1
+
+        # Calculate intersection
+        overlap_start = max(src_global_head_start, dst_global_head_start)
+        overlap_end = min(src_global_head_end, dst_global_head_end)
+
+        if overlap_start >= overlap_end:
+            return None  # No overlap
+
+        num_heads_to_send = overlap_end - overlap_start
+        src_head_start = overlap_start - src_global_head_start
+        dst_head_start = overlap_start - dst_global_head_start
 
         bytes_per_head_slice = bytes_per_token_dst // dst_heads_per_rank
         if bytes_per_head_slice == 0:
             raise ValueError("Head slice size evaluates to zero")
-
-        local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank = peer_info.decode_tp_rank % decode_tp_size
-
-        if prefill_tp_size > decode_tp_size:
-            src_head_start = 0
-            num_heads_to_send = src_heads_per_rank
-            dst_head_start = local_tp_rank * src_heads_per_rank
-        else:
-            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start = 0
 
         src_head_slice_offset = src_head_start * bytes_per_head_slice
         dst_head_slice_offset = dst_head_start * bytes_per_head_slice
@@ -691,6 +729,9 @@ class MoriKVManager(CommonKVManager):
 
             if tp_mismatch:
                 tp_cfg = self._build_tp_slice_config(peer_info)
+                # Skip if this rank should not send (replica rank returns None)
+                if tp_cfg is None:
+                    return []
                 for layer_id in range(layers_current_pp_stage):
                     statuses.extend(
                         self._issue_tp_slice_transfers(

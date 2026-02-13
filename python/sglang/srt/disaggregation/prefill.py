@@ -162,6 +162,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_item_lens = kv_item_lens
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
+            # Get total KV heads from model config for correct cross-TP transfer
+            model_config = self.scheduler.tp_worker.model_runner.model_config
+            kv_args.total_kv_heads = model_config.get_total_num_kv_heads()
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (

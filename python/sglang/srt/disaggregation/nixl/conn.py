@@ -487,43 +487,78 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int,
         dst_kv_item_len: int,
     ):
+        """
+        Sends KV cache slices supporting all TP configurations including TP > total_kv_heads.
+        """
         # Get configuration from kv_args
         local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
-
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
+        src_heads_per_rank = self.kv_args.kv_head_num
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
 
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
-        )
-
-        # Determine which heads to send
-        if prefill_tp_size > decode_tp_size:
-            # Multiple prefill ranks to one decode rank
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+        # Get total KV heads from kv_args (set from model config)
+        if hasattr(self.kv_args, 'total_kv_heads') and self.kv_args.total_kv_heads:
+            total_kv_heads = self.kv_args.total_kv_heads
         else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            src_head_start_offset = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
+            # Fallback for compatibility
+            total_kv_heads = src_heads_per_rank * prefill_tp_size
+            logger.warning(
+                f"total_kv_heads not set in kv_args, using fallback: {total_kv_heads}. "
+                "This may cause incorrect KV transfer when prefill TP > KV heads."
+            )
+
+        prefill_tp = prefill_tp_size
+        decode_tp = decode_tp_size
+
+        # Calculate replication factors
+        prefill_replicate = max(1, prefill_tp // total_kv_heads)
+        decode_replicate = max(1, decode_tp // total_kv_heads)
+
+        # Calculate per-rank heads on decode side
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp)
+
+        # Calculate global head range for current prefill rank
+        if prefill_tp <= total_kv_heads:
+            src_global_head_start = local_tp_rank_in_group * src_heads_per_rank
+            src_global_head_end = src_global_head_start + src_heads_per_rank
+        else:
+            if local_tp_rank_in_group % prefill_replicate != 0:
+                return None  # Skip replica ranks
+            head_idx = local_tp_rank_in_group // prefill_replicate
+            src_global_head_start = head_idx
+            src_global_head_end = head_idx + 1
+
+        # Calculate global head range for target decode rank
+        if decode_tp <= total_kv_heads:
+            dst_global_head_start = dst_tp_rank_in_group * dst_heads_per_rank
+            dst_global_head_end = dst_global_head_start + dst_heads_per_rank
+        else:
+            head_idx = dst_tp_rank_in_group // decode_replicate
+            dst_global_head_start = head_idx
+            dst_global_head_end = head_idx + 1
+
+        # Calculate intersection
+        overlap_start = max(src_global_head_start, dst_global_head_start)
+        overlap_end = min(src_global_head_end, dst_global_head_end)
+
+        if overlap_start >= overlap_end:
+            return None  # No overlap
+
+        num_heads_to_send = overlap_end - overlap_start
+        src_head_start_offset = overlap_start - src_global_head_start
+        dst_head_start_offset = overlap_start - dst_global_head_start
+
+        bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
             self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
-        # Calculate precise byte offset and length for the sub-slice within the token
-        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
-        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
-        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
+
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice
+        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
 
         src_dst_ptr_pairs = [
             (
@@ -738,7 +773,9 @@ class NixlKVManager(CommonKVManager):
                     ].dst_kv_item_len,
                 )
 
-            handles.append(kv_xfer_handle)
+            # Only append if handle is not None (replica ranks return None)
+            if kv_xfer_handle is not None:
+                handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
             if is_last:
                 if state_indices is not None:
