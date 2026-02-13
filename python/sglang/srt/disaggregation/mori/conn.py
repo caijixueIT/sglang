@@ -555,14 +555,8 @@ class MoriKVManager(CommonKVManager):
 
         src_heads_per_rank = self.kv_args.kv_head_num
 
-        # Get total KV heads from kv_args
-        if hasattr(self.kv_args, 'total_kv_heads') and self.kv_args.total_kv_heads:
-            total_kv_heads = self.kv_args.total_kv_heads
-        else:
-            total_kv_heads = src_heads_per_rank * prefill_tp
-            logger.warning(
-                f"total_kv_heads not set in kv_args, using fallback: {total_kv_heads}"
-            )
+        # Get total KV heads from kv_args (set from model config in prefill.py)
+        total_kv_heads = self.kv_args.total_kv_heads
 
         # Calculate replication factors
         prefill_replicate = max(1, prefill_tp // total_kv_heads)

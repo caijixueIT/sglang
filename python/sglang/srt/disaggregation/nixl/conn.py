@@ -498,16 +498,8 @@ class NixlKVManager(CommonKVManager):
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
 
-        # Get total KV heads from kv_args (set from model config)
-        if hasattr(self.kv_args, 'total_kv_heads') and self.kv_args.total_kv_heads:
-            total_kv_heads = self.kv_args.total_kv_heads
-        else:
-            # Fallback for compatibility
-            total_kv_heads = src_heads_per_rank * prefill_tp_size
-            logger.warning(
-                f"total_kv_heads not set in kv_args, using fallback: {total_kv_heads}. "
-                "This may cause incorrect KV transfer when prefill TP > KV heads."
-            )
+        # Get total KV heads from kv_args (set from model config in prefill.py)
+        total_kv_heads = self.kv_args.total_kv_heads
 
         prefill_tp = prefill_tp_size
         decode_tp = decode_tp_size
