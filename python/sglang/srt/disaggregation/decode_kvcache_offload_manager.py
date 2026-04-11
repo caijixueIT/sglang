@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,6 +30,15 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DecodeStorageReadSession:
+    req_id: str
+    host_indices: torch.Tensor
+    operation: object
+    started_at: float
+    requested_tokens: int
 
 
 class DecodeKVCacheOffloadManager:
@@ -103,6 +113,9 @@ class DecodeKVCacheOffloadManager:
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
+        self.ongoing_storage_reads = {}
+        self.completed_storage_reads = {}
+        self.storage_read_hit_tokens_total = 0
         self.offloaded_state = {}
         logger.info("Enable offload kv cache for decode side")
 
@@ -198,6 +211,8 @@ class DecodeKVCacheOffloadManager:
         n_write, n_backup = map(int, qsizes.tolist())
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
+        self._check_storage_read_progress()
+        self.cache_controller.drain_host_mem_release_queue()
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
@@ -293,6 +308,98 @@ class DecodeKVCacheOffloadManager:
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
+
+    def start_storage_read(
+        self,
+        req: "Req",
+        token_ids: list[int] | None = None,
+        prefix_keys: list[str] | None = None,
+    ) -> bool:
+        """Prefetch page-aligned request prefix from L3 into decode host memory."""
+        if not self.cache_controller.enable_storage:
+            return False
+
+        req_id = req.rid
+        if req_id in self.ongoing_storage_reads or req_id in self.completed_storage_reads:
+            return True
+
+        read_tokens = token_ids if token_ids is not None else req.origin_input_ids
+        aligned_len = len(read_tokens) // self.page_size * self.page_size
+        if aligned_len <= 0:
+            return False
+
+        host_indices = self.decode_host_mem_pool.alloc(aligned_len)
+        if host_indices is None:
+            logger.warning(
+                "Decode storage read skipped for req %s due to insufficient host memory",
+                req_id,
+            )
+            return False
+
+        operation = self.cache_controller.prefetch(
+            req_id,
+            host_indices,
+            read_tokens[:aligned_len],
+            prefix_keys=prefix_keys,
+        )
+        self.ongoing_storage_reads[req_id] = DecodeStorageReadSession(
+            req_id=req_id,
+            host_indices=host_indices,
+            operation=operation,
+            started_at=time.time(),
+            requested_tokens=aligned_len,
+        )
+        return True
+
+    def _check_storage_read_progress(self):
+        completed_req_ids = []
+        for req_id, session in self.ongoing_storage_reads.items():
+            operation = session.operation
+            target_tokens = len(operation.hash_value) * self.page_size
+
+            if target_tokens == 0 and not operation.is_terminated():
+                continue
+
+            if operation.is_terminated() or operation.completed_tokens >= target_tokens:
+                hit_tokens = min(operation.completed_tokens, target_tokens)
+                if hit_tokens > 0:
+                    self.completed_storage_reads[req_id] = (
+                        operation.host_indices[:hit_tokens],
+                        hit_tokens,
+                        session.started_at,
+                    )
+                    self.storage_read_hit_tokens_total += hit_tokens
+                else:
+                    self.decode_host_mem_pool.free(session.host_indices)
+                completed_req_ids.append(req_id)
+
+        for req_id in completed_req_ids:
+            self.ongoing_storage_reads.pop(req_id, None)
+
+    def take_completed_storage_read(
+        self, req_id: str
+    ) -> tuple[torch.Tensor, int, float] | None:
+        return self.completed_storage_reads.pop(req_id, None)
+
+    def release_completed_storage_read(self, req_id: str) -> None:
+        session = self.completed_storage_reads.pop(req_id, None)
+        if session is None:
+            return
+        host_indices, _, _ = session
+        self.decode_host_mem_pool.free(host_indices)
+
+    def get_runtime_status(self) -> dict[str, int]:
+        status = self.cache_controller.get_runtime_status()
+        status.update(
+            {
+                "decode_offload_pending_reqs": len(self.ongoing_offload),
+                "decode_backup_pending_reqs": len(self.ongoing_backup),
+                "decode_storage_read_pending_reqs": len(self.ongoing_storage_reads),
+                "decode_storage_read_completed_reqs": len(self.completed_storage_reads),
+                "decode_storage_read_hit_tokens": self.storage_read_hit_tokens_total,
+            }
+        )
+        return status
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""

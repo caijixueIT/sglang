@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVReceiver,
     BaseKVSender,
     KVArgs,
+    KVTransferDirection,
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -94,6 +95,25 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.transfer_direction = getattr(
+            args,
+            "transfer_direction",
+            KVTransferDirection.PREFILL_TO_DECODE.value,
+        )
+        self.is_sender_role = (
+            self.transfer_direction == KVTransferDirection.PREFILL_TO_DECODE.value
+            and disaggregation_mode == DisaggregationMode.PREFILL
+        ) or (
+            self.transfer_direction == KVTransferDirection.DECODE_TO_PREFILL.value
+            and disaggregation_mode == DisaggregationMode.DECODE
+        )
+        self.is_receiver_role = (
+            self.transfer_direction == KVTransferDirection.PREFILL_TO_DECODE.value
+            and disaggregation_mode == DisaggregationMode.DECODE
+        ) or (
+            self.transfer_direction == KVTransferDirection.DECODE_TO_PREFILL.value
+            and disaggregation_mode == DisaggregationMode.PREFILL
+        )
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -131,7 +151,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.is_sender_role:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
@@ -147,8 +167,12 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.enable_staging: bool = False
+        elif self.is_receiver_role:
+            self.enable_staging: bool = (
+                self.transfer_direction == KVTransferDirection.PREFILL_TO_DECODE.value
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            )
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -172,7 +196,8 @@ class CommonKVManager(BaseKVManager):
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         else:
             raise ValueError(
-                f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
+                "Unsupported disaggregation role combination: "
+                f"mode={self.disaggregation_mode}, direction={self.transfer_direction}"
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:

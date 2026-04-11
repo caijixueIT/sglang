@@ -821,6 +821,44 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
+    def drain_host_mem_release_queue(self) -> int:
+        """Best-effort release of queued host pages.
+
+        HiRadix-based flows drain this queue in the tree cache. Decode-side DualPath
+        prefetch reuses the same controller without a tree cache consumer, so expose a
+        generic helper here.
+        """
+        released = 0
+        while True:
+            try:
+                page = self.host_mem_release_queue.get_nowait()
+            except Empty:
+                break
+            self.mem_pool_host.free(page)
+            released += len(page)
+        return released
+
+    def get_runtime_status(self) -> dict[str, int]:
+        return {
+            "storage_enabled": int(self.enable_storage),
+            "prefetch_queue_ops": self.prefetch_queue.qsize()
+            if hasattr(self, "prefetch_queue")
+            else 0,
+            "backup_queue_ops": self.backup_queue.qsize()
+            if hasattr(self, "backup_queue")
+            else 0,
+            "ack_load_queue_ops": len(self.ack_load_queue),
+            "ack_backup_queue_ops": self.ack_backup_queue.qsize()
+            if hasattr(self, "ack_backup_queue")
+            else 0,
+            "prefetch_tokens_occupied": int(
+                getattr(self, "prefetch_tokens_occupied", 0)
+            ),
+            "host_mem_release_queue_ops": self.host_mem_release_queue.qsize()
+            if hasattr(self, "host_mem_release_queue")
+            else 0,
+        }
+
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):

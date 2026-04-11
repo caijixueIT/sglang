@@ -1815,6 +1815,10 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                dualpath_decode_bootstrap_host=recv_req.dualpath_decode_bootstrap_host,
+                dualpath_decode_bootstrap_port=recv_req.dualpath_decode_bootstrap_port,
+                dualpath_mode=recv_req.dualpath_mode,
+                dualpath_selected_path=recv_req.dualpath_selected_path,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -2563,7 +2567,12 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(
+            self
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.server_args.dualpath_enable
+            else None
+        )
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(

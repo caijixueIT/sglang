@@ -39,6 +39,7 @@ import copy
 import dataclasses
 import logging
 import re
+import time
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -50,11 +51,11 @@ import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.base import BaseKVSender
+from sglang.srt.disaggregation.base import BaseKVSender, KVPoll
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, kv_to_page_indices
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
@@ -583,6 +584,10 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        dualpath_decode_bootstrap_host: Optional[str] = None,
+        dualpath_decode_bootstrap_port: Optional[int] = None,
+        dualpath_mode: Optional[str] = None,
+        dualpath_selected_path: Optional[str] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -851,7 +856,23 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.dualpath_decode_bootstrap_host: Optional[str] = (
+            dualpath_decode_bootstrap_host
+        )
+        self.dualpath_decode_bootstrap_port: Optional[int] = (
+            dualpath_decode_bootstrap_port
+        )
+        self.dualpath_mode: Optional[str] = dualpath_mode
+        self.dualpath_selected_path: Optional[str] = dualpath_selected_path
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.dualpath_reverse_receiver = None
+        self.dualpath_reverse_sender = None
+        self.dualpath_reverse_sender_aux_index: int = -1
+        self.dualpath_reverse_receiver_aux_index: int = -1
+        self.dualpath_reverse_source_indices = None
+        self.dualpath_reverse_source_tokens: int = 0
+        self.dualpath_reverse_send_started: bool = False
+        self.dualpath_reverse_transfer_done: bool = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1491,6 +1512,115 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def _apply_dualpath_reverse_prefill_merge(
+        self,
+        scheduler,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: list[int],
+    ) -> torch.Tensor:
+        reverse_factory = getattr(
+            getattr(scheduler, "disagg_prefill_bootstrap_queue", None),
+            "create_reverse_receiver",
+            None,
+        )
+        if reverse_factory is None:
+            return out_cache_loc
+
+        allocator = getattr(scheduler, "req_to_metadata_buffer_idx_allocator", None)
+        if allocator is None:
+            return out_cache_loc
+
+        page_size = self.tree_cache.page_size
+        wait_budget_s = 0.05
+        cursor = 0
+        out_slices: list[torch.Tensor] = []
+        updated = False
+
+        for req, req_pool_idx in zip(self.reqs, req_pool_indices):
+            seq_len = len(req.fill_ids)
+            prefix_len = len(req.prefix_indices)
+            extend_len = req.extend_input_len
+            req_slice = out_cache_loc[cursor : cursor + extend_len]
+            cursor += extend_len
+
+            can_try_reverse = (
+                req.dualpath_selected_path == "de_read"
+                and prefix_len == 0
+                and req.host_hit_length == 0
+                and req.bootstrap_room is not None
+                and req.dualpath_decode_bootstrap_host is not None
+                and extend_len == seq_len
+            )
+            if not can_try_reverse:
+                out_slices.append(req_slice)
+                continue
+
+            receiver = req.dualpath_reverse_receiver or reverse_factory(req)
+            if receiver is None:
+                out_slices.append(req_slice)
+                continue
+            req.dualpath_reverse_receiver = receiver
+
+            max_hit_tokens = min((len(req.origin_input_ids) // page_size) * page_size, extend_len)
+            if max_hit_tokens <= 0 or allocator.available_size() == 0:
+                out_slices.append(req_slice)
+                continue
+
+            aux_idx = allocator.alloc()
+            if aux_idx is None:
+                out_slices.append(req_slice)
+                continue
+            req.dualpath_reverse_receiver_aux_index = aux_idx
+
+            dst_page_indices = kv_to_page_indices(
+                req_slice[:max_hit_tokens].cpu().numpy(),
+                page_size,
+            )
+            receiver.send_metadata(dst_page_indices, aux_idx)
+
+            hit_tokens = 0
+            deadline = time.time() + wait_budget_s
+            while time.time() < deadline:
+                poll = receiver.poll()
+                if poll == KVPoll.Success:
+                    hit_tokens = int(
+                        scheduler.disagg_metadata_buffers.cached_tokens[aux_idx][0].item()
+                    )
+                    break
+                if poll == KVPoll.Failed:
+                    break
+                time.sleep(0.001)
+
+            if hasattr(receiver, "clear"):
+                receiver.clear()
+            allocator.free(aux_idx)
+            req.dualpath_reverse_receiver_aux_index = -1
+            req.dualpath_reverse_receiver = None
+
+            hit_tokens = min(hit_tokens, max_hit_tokens)
+            if hit_tokens <= 0:
+                out_slices.append(req_slice)
+                continue
+
+            req.req_pool_idx = req_pool_idx
+            prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :hit_tokens
+            ].to(torch.int64)
+            req.prefix_indices = prefix_indices
+            req.host_hit_length = hit_tokens
+            req.storage_hit_length = max(req.storage_hit_length, hit_tokens)
+            req.set_extend_input_len(len(req.fill_ids) - hit_tokens)
+            req.kv_committed_len = len(req.fill_ids)
+            req.kv_allocated_len = len(req.fill_ids)
+            updated = True
+            out_slices.append(req_slice[hit_tokens:])
+
+        if not updated:
+            return out_cache_loc
+        if any(len(slice_) > 0 for slice_ in out_slices):
+            return torch.cat([slice_ for slice_ in out_slices if len(slice_) > 0])
+        return torch.empty((0,), dtype=out_cache_loc.dtype, device=out_cache_loc.device)
+
     def is_dllm(self):
         return self.dllm_config is not None
 
@@ -1569,7 +1699,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, dualpath_prefill_scheduler=None):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -1599,9 +1729,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1628,6 +1755,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self
         )
 
+        for i, (req, seq_len) in enumerate(zip(reqs, seq_lens)):
+            req.req_pool_idx = req_pool_indices[i]
+            req.extend_batch_idx += 1
+
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
+        if dualpath_prefill_scheduler is not None:
+            out_cache_loc = self._apply_dualpath_reverse_prefill_merge(
+                dualpath_prefill_scheduler, out_cache_loc, req_pool_indices
+            )
+
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        extend_lens = [r.extend_input_len for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_num_tokens = extend_num_tokens
+
         # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
@@ -1642,14 +1794,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
-
-            req.extend_batch_idx += 1
-
-            # update req-level memory management fields
-            req.kv_committed_len = seq_len
-            req.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:

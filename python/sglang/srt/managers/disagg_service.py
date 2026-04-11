@@ -18,14 +18,22 @@ def start_disagg_service(
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
-        # only start bootstrap server on prefill tm
+    if disagg_mode == DisaggregationMode.PREFILL or (
+        server_args.dualpath_enable and disagg_mode == DisaggregationMode.DECODE
+    ):
+        # Default PD starts bootstrap on prefill. DualPath needs the symmetric
+        # bootstrap service on decode as well for reverse transfer setup.
+        bootstrap_port = (
+            server_args.get_dualpath_decode_bootstrap_port()
+            if server_args.dualpath_enable and disagg_mode == DisaggregationMode.DECODE
+            else server_args.disaggregation_bootstrap_port
+        )
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
         bootstrap_server = kv_bootstrap_server_class(
             host=server_args.host,
-            port=server_args.disaggregation_bootstrap_port,
+            port=bootstrap_port,
         )
         is_create_store = (
             server_args.node_rank == 0 and transfer_backend == TransferBackend.ASCEND

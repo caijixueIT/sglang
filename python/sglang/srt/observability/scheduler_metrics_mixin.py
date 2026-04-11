@@ -16,6 +16,7 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    HiCacheMetrics,
     LoRAMetrics,
     MemoryMetrics,
     QueueMetrics,
@@ -693,17 +694,49 @@ class SchedulerMetricsMixin:
 
         These are pushed to Prometheus by SchedulerMetricsCollector.log_stats().
         """
-        if not self.enable_hierarchical_cache:
-            return
+        if self.enable_hierarchical_cache:
+            host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+                self.tree_cache, "full_kv_pool_host", None
+            )
+            assert host_pool is not None, "Host pool not found"
+            self.stats.hicache_host_used_tokens = (
+                host_pool.size - host_pool.available_size()
+            )
+            self.stats.hicache_host_total_tokens = host_pool.size
+            cache_controller = getattr(self.tree_cache, "cache_controller", None)
+            if cache_controller is not None:
+                runtime_status = cache_controller.get_runtime_status()
+                self.stats.hicache_prefetch_queue_ops = runtime_status[
+                    "prefetch_queue_ops"
+                ]
+                self.stats.hicache_backup_queue_ops = runtime_status[
+                    "backup_queue_ops"
+                ]
+                self.stats.hicache_ack_load_queue_ops = runtime_status[
+                    "ack_load_queue_ops"
+                ]
+                self.stats.hicache_ack_backup_queue_ops = runtime_status[
+                    "ack_backup_queue_ops"
+                ]
+                self.stats.hicache_prefetch_tokens_occupied = runtime_status[
+                    "prefetch_tokens_occupied"
+                ]
 
-        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
-            self.tree_cache, "full_kv_pool_host", None
-        )
-        assert host_pool is not None, "Host pool not found"
-        self.stats.hicache_host_used_tokens = (
-            host_pool.size - host_pool.available_size()
-        )
-        self.stats.hicache_host_total_tokens = host_pool.size
+        decode_offload_manager = getattr(self, "decode_offload_manager", None)
+        if decode_offload_manager is not None:
+            decode_status = decode_offload_manager.get_runtime_status()
+            self.stats.decode_offload_pending_reqs = decode_status[
+                "decode_offload_pending_reqs"
+            ]
+            self.stats.decode_backup_pending_reqs = decode_status[
+                "decode_backup_pending_reqs"
+            ]
+            self.stats.decode_storage_read_pending_reqs = decode_status[
+                "decode_storage_read_pending_reqs"
+            ]
+            self.stats.decode_storage_read_hit_tokens = decode_status[
+                "decode_storage_read_hit_tokens"
+            ]
 
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""
@@ -881,6 +914,10 @@ class SchedulerMetricsMixin:
             decode_prealloc = 0
             decode_transfer = 0
             decode_retracted = 0
+            decode_offload_pending = 0
+            decode_backup_pending = 0
+            decode_storage_read_pending = 0
+            decode_storage_read_hit_tokens = 0
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
@@ -893,6 +930,20 @@ class SchedulerMetricsMixin:
                 decode_retracted = len(
                     self.disagg_decode_prealloc_queue.retracted_queue
                 )
+                if getattr(self, "decode_offload_manager", None) is not None:
+                    decode_runtime = self.decode_offload_manager.get_runtime_status()
+                    decode_offload_pending = decode_runtime[
+                        "decode_offload_pending_reqs"
+                    ]
+                    decode_backup_pending = decode_runtime[
+                        "decode_backup_pending_reqs"
+                    ]
+                    decode_storage_read_pending = decode_runtime[
+                        "decode_storage_read_pending_reqs"
+                    ]
+                    decode_storage_read_hit_tokens = decode_runtime[
+                        "decode_storage_read_hit_tokens"
+                    ]
 
             disaggregation = DisaggregationMetrics(
                 mode=mode_str,
@@ -903,6 +954,10 @@ class SchedulerMetricsMixin:
                 decode_retracted_queue_reqs=decode_retracted,
                 kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,
                 kv_transfer_latency_ms=self.stats.kv_transfer_latency_ms,
+                decode_offload_pending_reqs=decode_offload_pending,
+                decode_backup_pending_reqs=decode_backup_pending,
+                decode_storage_read_pending_reqs=decode_storage_read_pending,
+                decode_storage_read_hit_tokens=decode_storage_read_hit_tokens,
             )
 
         queues = None
@@ -912,6 +967,38 @@ class SchedulerMetricsMixin:
                 grammar=self.stats.num_grammar_queue_reqs,
                 paused=self.stats.num_paused_reqs,
                 retracted=self.stats.num_retracted_reqs,
+            )
+
+        hicache = None
+        if include_all or "hicache" in include:
+            host_used_tokens = 0
+            host_total_tokens = 0
+            runtime_status = {
+                "prefetch_queue_ops": 0,
+                "backup_queue_ops": 0,
+                "ack_load_queue_ops": 0,
+                "ack_backup_queue_ops": 0,
+                "prefetch_tokens_occupied": 0,
+                "storage_enabled": 0,
+            }
+            host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+                self.tree_cache, "full_kv_pool_host", None
+            )
+            if host_pool is not None:
+                host_used_tokens = host_pool.size - host_pool.available_size()
+                host_total_tokens = host_pool.size
+            cache_controller = getattr(self.tree_cache, "cache_controller", None)
+            if cache_controller is not None:
+                runtime_status = cache_controller.get_runtime_status()
+            hicache = HiCacheMetrics(
+                host_used_tokens=host_used_tokens,
+                host_total_tokens=host_total_tokens,
+                prefetch_queue_ops=runtime_status["prefetch_queue_ops"],
+                backup_queue_ops=runtime_status["backup_queue_ops"],
+                ack_load_queue_ops=runtime_status["ack_load_queue_ops"],
+                ack_backup_queue_ops=runtime_status["ack_backup_queue_ops"],
+                prefetch_tokens_occupied=runtime_status["prefetch_tokens_occupied"],
+                storage_enabled=runtime_status["storage_enabled"],
             )
 
         return GetLoadsReqOutput(
@@ -931,6 +1018,7 @@ class SchedulerMetricsMixin:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            hicache=hicache,
         )
 
     @contextmanager

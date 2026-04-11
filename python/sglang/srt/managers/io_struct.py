@@ -196,8 +196,12 @@ class GenerateReqInput(BaseReq):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    dualpath_decode_bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
+    dualpath_decode_bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    dualpath_mode: Optional[Union[List[Optional[str]], str]] = None
+    dualpath_selected_path: Optional[Union[List[Optional[str]], str]] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -589,6 +593,30 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_room, list):
             self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
 
+        # Normalize dualpath_decode_bootstrap_host
+        if self.dualpath_decode_bootstrap_host is None:
+            self.dualpath_decode_bootstrap_host = [None] * num
+        elif not isinstance(self.dualpath_decode_bootstrap_host, list):
+            self.dualpath_decode_bootstrap_host = [
+                self.dualpath_decode_bootstrap_host
+            ] * num
+        elif isinstance(self.dualpath_decode_bootstrap_host, list):
+            self.dualpath_decode_bootstrap_host = (
+                self.dualpath_decode_bootstrap_host * self.parallel_sample_num
+            )
+
+        # Normalize dualpath_decode_bootstrap_port
+        if self.dualpath_decode_bootstrap_port is None:
+            self.dualpath_decode_bootstrap_port = [None] * num
+        elif not isinstance(self.dualpath_decode_bootstrap_port, list):
+            self.dualpath_decode_bootstrap_port = [
+                self.dualpath_decode_bootstrap_port
+            ] * num
+        elif isinstance(self.dualpath_decode_bootstrap_port, list):
+            self.dualpath_decode_bootstrap_port = (
+                self.dualpath_decode_bootstrap_port * self.parallel_sample_num
+            )
+
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
             self.bootstrap_pair_key = [None] * num
@@ -596,6 +624,24 @@ class GenerateReqInput(BaseReq):
             self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
+
+        # Normalize dualpath_mode
+        if self.dualpath_mode is None:
+            self.dualpath_mode = [None] * num
+        elif not isinstance(self.dualpath_mode, list):
+            self.dualpath_mode = [self.dualpath_mode] * num
+        elif isinstance(self.dualpath_mode, list):
+            self.dualpath_mode = self.dualpath_mode * self.parallel_sample_num
+
+        # Normalize dualpath_selected_path
+        if self.dualpath_selected_path is None:
+            self.dualpath_selected_path = [None] * num
+        elif not isinstance(self.dualpath_selected_path, list):
+            self.dualpath_selected_path = [self.dualpath_selected_path] * num
+        elif isinstance(self.dualpath_selected_path, list):
+            self.dualpath_selected_path = (
+                self.dualpath_selected_path * self.parallel_sample_num
+            )
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
@@ -665,6 +711,16 @@ class GenerateReqInput(BaseReq):
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            dualpath_decode_bootstrap_host=(
+                self.dualpath_decode_bootstrap_host[i]
+                if self.dualpath_decode_bootstrap_host is not None
+                else None
+            ),
+            dualpath_decode_bootstrap_port=(
+                self.dualpath_decode_bootstrap_port[i]
+                if self.dualpath_decode_bootstrap_port is not None
+                else None
+            ),
             bootstrap_pair_key=(
                 self.bootstrap_pair_key[i]
                 if self.bootstrap_pair_key is not None
@@ -672,6 +728,14 @@ class GenerateReqInput(BaseReq):
             ),
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
+            ),
+            dualpath_mode=(
+                self.dualpath_mode[i] if self.dualpath_mode is not None else None
+            ),
+            dualpath_selected_path=(
+                self.dualpath_selected_path[i]
+                if self.dualpath_selected_path is not None
+                else None
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
@@ -740,8 +804,12 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    dualpath_decode_bootstrap_host: Optional[str] = None
+    dualpath_decode_bootstrap_port: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    dualpath_mode: Optional[str] = None
+    dualpath_selected_path: Optional[str] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -1924,6 +1992,52 @@ class DisaggregationMetrics:
     kv_transfer_latency_ms: float = field(
         default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
     )
+    decode_offload_pending_reqs: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Decode-side offload requests in progress")},
+    )
+    decode_backup_pending_reqs: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Decode-side backup requests in progress")},
+    )
+    decode_storage_read_pending_reqs: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Decode-side storage read requests in progress")},
+    )
+    decode_storage_read_hit_tokens: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Decode-side storage read hit tokens")},
+    )
+
+
+@dataclass
+class HiCacheMetrics:
+    """HiCache runtime metrics."""
+
+    host_used_tokens: int = field(
+        metadata={"metric": ("gauge", "HiCache host tokens currently used")}
+    )
+    host_total_tokens: int = field(
+        metadata={"metric": ("gauge", "HiCache host token capacity")}
+    )
+    prefetch_queue_ops: int = field(
+        metadata={"metric": ("gauge", "HiCache prefetch queue depth")}
+    )
+    backup_queue_ops: int = field(
+        metadata={"metric": ("gauge", "HiCache backup queue depth")}
+    )
+    ack_load_queue_ops: int = field(
+        metadata={"metric": ("gauge", "HiCache device-load ack queue depth")}
+    )
+    ack_backup_queue_ops: int = field(
+        metadata={"metric": ("gauge", "HiCache backup ack queue depth")}
+    )
+    prefetch_tokens_occupied: int = field(
+        metadata={"metric": ("gauge", "HiCache tokens reserved by prefetch")}
+    )
+    storage_enabled: int = field(
+        metadata={"metric": ("gauge", "Whether HiCache storage tier is enabled")}
+    )
 
 
 @dataclass
@@ -1945,7 +2059,7 @@ class GetLoadsReqInput(BaseReq):
     """Request for /v1/loads endpoint."""
 
     VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+        {"core", "memory", "spec", "lora", "disagg", "queues", "hicache", "all"}
     )
 
     include: List[str] = field(default_factory=lambda: ["all"])
@@ -2002,6 +2116,7 @@ class GetLoadsReqOutput(BaseReq):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    hicache: Optional[HiCacheMetrics] = None
 
 
 @dataclass

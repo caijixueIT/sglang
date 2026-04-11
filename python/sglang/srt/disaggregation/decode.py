@@ -34,6 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import KVTransferDirection
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -301,6 +302,15 @@ class DecodePreallocQueue:
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        self.reverse_transfer_queue: List[Req] = []
+        self.reverse_host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            self.tree_cache, "full_kv_pool_host", None
+        )
+        self.reverse_kv_manager = (
+            self._init_reverse_kv_manager()
+            if self.scheduler.server_args.dualpath_enable
+            else None
+        )
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
@@ -378,6 +388,8 @@ class DecodePreallocQueue:
             kv_args.state_type = "none"
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_traffic_class = self.scheduler.server_args.dualpath_ib_traffic_class
+        kv_args.transfer_direction = KVTransferDirection.PREFILL_TO_DECODE.value
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -403,6 +415,168 @@ class DecodePreallocQueue:
                     )
         return kv_manager
 
+    def _init_reverse_kv_manager(self) -> Optional[CommonKVManager]:
+        if self.reverse_host_pool is None:
+            return None
+
+        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args = kv_args_class()
+        attn_tp_size = get_attention_tp_size()
+        kv_args.engine_rank = self.tp_rank % attn_tp_size
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            self.reverse_host_pool.get_contiguous_buf_infos()
+        )
+        kv_args.kv_data_ptrs = kv_data_ptrs
+        kv_args.kv_data_lens = kv_data_lens
+        kv_args.kv_item_lens = kv_item_lens
+        kv_args.page_size = self.reverse_host_pool.page_size
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
+        kv_args.state_data_ptrs = []
+        kv_args.state_data_lens = []
+        kv_args.state_item_lens = []
+        kv_args.state_type = "none"
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.reverse_host_pool.head_num
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_traffic_class = self.scheduler.server_args.dualpath_ib_traffic_class
+        kv_args.transfer_direction = KVTransferDirection.DECODE_TO_PREFILL.value
+        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        return kv_manager_class(
+            kv_args,
+            DisaggregationMode.DECODE,
+            self.scheduler.server_args,
+            self.is_mla_backend,
+        )
+
+    def _dualpath_sender_has_metadata(self, req: Req) -> bool:
+        if req.dualpath_reverse_sender is None or req.bootstrap_room is None:
+            return False
+        transfer_infos = getattr(req.dualpath_reverse_sender.kv_mgr, "transfer_infos", None)
+        if transfer_infos is None:
+            return True
+        return req.bootstrap_room in transfer_infos
+
+    def process_reverse_transfers(self):
+        if (
+            self.reverse_kv_manager is None
+            or self.reverse_host_pool is None
+            or getattr(self.scheduler, "decode_offload_manager", None) is None
+        ):
+            return
+
+        active_reqs = [
+            decode_req.req for decode_req in self.queue
+        ] + [
+            decode_req.req for decode_req in self.pending_reqs
+        ] + [
+            decode_req.req for decode_req in self.transfer_queue.queue
+        ]
+
+        page_size = self.reverse_host_pool.page_size
+        for req in active_reqs:
+            if (
+                req.dualpath_selected_path != "de_read"
+                or req.dualpath_reverse_sender is not None
+                or req.dualpath_reverse_transfer_done
+                or req.dualpath_decode_bootstrap_host is None
+                or req.bootstrap_room is None
+            ):
+                continue
+            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                break
+
+            completed = self.scheduler.decode_offload_manager.take_completed_storage_read(
+                req.rid
+            )
+            if completed is None:
+                continue
+
+            host_indices, hit_tokens, _ = completed
+            if hit_tokens <= 0:
+                self.reverse_host_pool.free(host_indices)
+                continue
+
+            backend = (
+                TransferBackend.FAKE
+                if req.dualpath_decode_bootstrap_host == FAKE_BOOTSTRAP_HOST
+                else self.transfer_backend
+            )
+            kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
+            req.dualpath_reverse_sender_aux_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            if req.dualpath_reverse_sender_aux_index is None:
+                self.reverse_host_pool.free(host_indices)
+                break
+
+            self.metadata_buffers.cached_tokens[req.dualpath_reverse_sender_aux_index][
+                0
+            ] = hit_tokens
+            req.dualpath_reverse_source_indices = (
+                host_indices,
+                kv_to_page_indices(host_indices[:hit_tokens].cpu().numpy(), page_size),
+            )
+            req.dualpath_reverse_source_tokens = hit_tokens
+            req.dualpath_reverse_send_started = False
+            bootstrap_port = req.dualpath_decode_bootstrap_port or self.bootstrap_port
+            req.dualpath_reverse_sender = kv_sender_class(
+                mgr=self.reverse_kv_manager,
+                bootstrap_addr=f"{req.dualpath_decode_bootstrap_host}:{bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                dest_tp_ranks=[self.tp_rank],
+                pp_rank=self.pp_rank,
+            )
+            req.dualpath_reverse_sender.init(
+                len(req.dualpath_reverse_source_indices[1]),
+                req.dualpath_reverse_sender_aux_index,
+            )
+            self.reverse_transfer_queue.append(req)
+
+        remaining: List[Req] = []
+        for req in self.reverse_transfer_queue:
+            sender = req.dualpath_reverse_sender
+            if sender is None:
+                continue
+            poll = sender.poll()
+            if (
+                poll == KVPoll.WaitingForInput
+                and not req.dualpath_reverse_send_started
+                and self._dualpath_sender_has_metadata(req)
+            ):
+                sender.send(req.dualpath_reverse_source_indices[1])
+                req.dualpath_reverse_send_started = True
+                remaining.append(req)
+                continue
+            if poll in (KVPoll.Bootstrapping, KVPoll.WaitingForInput, KVPoll.Transferring):
+                remaining.append(req)
+                continue
+
+            host_indices = (
+                req.dualpath_reverse_source_indices[0]
+                if req.dualpath_reverse_source_indices is not None
+                else None
+            )
+            if host_indices is not None:
+                self.reverse_host_pool.free(host_indices)
+            if req.dualpath_reverse_sender_aux_index >= 0:
+                self.req_to_metadata_buffer_idx_allocator.free(
+                    req.dualpath_reverse_sender_aux_index
+                )
+                req.dualpath_reverse_sender_aux_index = -1
+            req.dualpath_reverse_source_indices = None
+            req.dualpath_reverse_transfer_done = poll == KVPoll.Success
+            req.dualpath_reverse_sender = None
+
+        self.reverse_transfer_queue = remaining
+
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         if self._check_if_req_exceed_kv_capacity(req):
@@ -413,6 +587,12 @@ class DecodePreallocQueue:
             self.retracted_queue.append(req)
         else:
             decode_req = self._create_receiver_and_enqueue(req)
+
+            if (
+                req.dualpath_selected_path == "de_read"
+                and getattr(self.scheduler, "decode_offload_manager", None) is not None
+            ):
+                self.scheduler.decode_offload_manager.start_storage_read(req)
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
@@ -1331,6 +1511,8 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler):
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
+        if getattr(self.server_args, "dualpath_enable", False):
+            self.disagg_decode_prealloc_queue.process_reverse_transfers()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

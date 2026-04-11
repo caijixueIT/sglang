@@ -24,6 +24,8 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    dualpath_enable: bool = False
+    dualpath_mode: str = "prefill_only"
 
     # Routing policy
     policy: str = "cache_aware"
@@ -386,6 +388,19 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}dualpath-enable",
+            action="store_true",
+            default=RouterArgs.dualpath_enable,
+            help="Enable experimental DualPath request tagging and path selection.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}dualpath-mode",
+            type=str,
+            default=RouterArgs.dualpath_mode,
+            choices=["prefill_only", "decode_only", "hybrid_auto"],
+            help="DualPath mode used by the PD router.",
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",

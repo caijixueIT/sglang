@@ -707,6 +707,13 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    dualpath_enable: bool = False
+    dualpath_decode_bootstrap_port: Optional[int] = None
+    dualpath_static_mode: Literal["prefill_only", "decode_only", "hybrid_auto"] = (
+        "prefill_only"
+    )
+    dualpath_layer_streaming_chunk_pages: int = 16
+    dualpath_ib_traffic_class: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
@@ -3471,6 +3478,21 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if self.dualpath_enable and self.disaggregation_mode == "null":
+            raise ValueError(
+                "The argument dualpath-enable requires --disaggregation-mode to be prefill or decode."
+            )
+        if (
+            self.dualpath_decode_bootstrap_port is not None
+            and self.dualpath_decode_bootstrap_port <= 0
+        ):
+            raise ValueError(
+                "The argument dualpath-decode-bootstrap-port must be positive."
+            )
+        if self.dualpath_layer_streaming_chunk_pages <= 0:
+            raise ValueError(
+                "The argument dualpath-layer-streaming-chunk-pages must be positive."
+            )
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
@@ -3485,7 +3507,6 @@ class ServerArgs:
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
-
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -3496,6 +3517,11 @@ class ServerArgs:
                     f"disaggregation_transfer_backend='mooncake', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
+
+    def get_dualpath_decode_bootstrap_port(self) -> int:
+        if self.dualpath_decode_bootstrap_port is not None:
+            return self.dualpath_decode_bootstrap_port
+        return self.disaggregation_bootstrap_port + 1
 
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
@@ -6078,6 +6104,37 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--dualpath-enable",
+            action="store_true",
+            default=ServerArgs.dualpath_enable,
+            help="Enable experimental DualPath control-plane plumbing for PD disaggregation.",
+        )
+        parser.add_argument(
+            "--dualpath-decode-bootstrap-port",
+            type=int,
+            default=ServerArgs.dualpath_decode_bootstrap_port,
+            help="Optional bootstrap server port dedicated to decode->prefill DualPath transfers. Defaults to disaggregation-bootstrap-port + 1.",
+        )
+        parser.add_argument(
+            "--dualpath-static-mode",
+            type=str,
+            default=ServerArgs.dualpath_static_mode,
+            choices=["prefill_only", "decode_only", "hybrid_auto"],
+            help="Static path selection for DualPath-aware requests.",
+        )
+        parser.add_argument(
+            "--dualpath-layer-streaming-chunk-pages",
+            type=int,
+            default=ServerArgs.dualpath_layer_streaming_chunk_pages,
+            help="Experimental chunk size, in pages, for DualPath layer streaming.",
+        )
+        parser.add_argument(
+            "--dualpath-ib-traffic-class",
+            type=str,
+            default=ServerArgs.dualpath_ib_traffic_class,
+            help="Optional low-priority traffic class/QoS hint for DualPath transfers.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",

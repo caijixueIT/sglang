@@ -28,6 +28,14 @@ class EngineBase(ABC):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        dualpath_decode_bootstrap_host: Optional[
+            Union[List[Optional[str]], str]
+        ] = None,
+        dualpath_decode_bootstrap_port: Optional[
+            Union[List[Optional[int]], int]
+        ] = None,
+        dualpath_mode: Optional[Union[List[Optional[str]], str]] = None,
+        dualpath_selected_path: Optional[Union[List[Optional[str]], str]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,

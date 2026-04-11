@@ -210,6 +210,14 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
+    /// Enable experimental DualPath request tagging and path selection
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    dualpath_enable: bool,
+
+    /// DualPath mode used by the PD router
+    #[arg(long, default_value = "prefill_only", value_parser = ["prefill_only", "decode_only", "hybrid_auto"], help_heading = "PD Disaggregation")]
+    dualpath_mode: String,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
@@ -1186,6 +1194,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli_args.service_discovery && !cli_args.enable_igw {
         println!("INFO: IGW mode automatically enabled because service discovery is turned on");
         cli_args.enable_igw = true;
+    }
+
+    if cli_args.dualpath_enable {
+        std::env::set_var("SGLANG_ROUTER_DUALPATH_ENABLE", "1");
+        std::env::set_var("SGLANG_ROUTER_DUALPATH_MODE", &cli_args.dualpath_mode);
     }
 
     println!("SGLang Router starting...");

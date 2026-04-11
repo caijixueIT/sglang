@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{env, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -213,6 +213,114 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const DUALPATH_DECODE_BOOTSTRAP_HOST_KEY: &'static str =
+        "dualpath_decode_bootstrap_host";
+    const DUALPATH_DECODE_BOOTSTRAP_PORT_KEY: &'static str =
+        "dualpath_decode_bootstrap_port";
+    const DUALPATH_MODE_KEY: &'static str = "dualpath_mode";
+    const DUALPATH_SELECTED_PATH_KEY: &'static str = "dualpath_selected_path";
+
+    fn env_flag(name: &str) -> bool {
+        matches!(
+            env::var(name)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    fn configured_dualpath_mode() -> Option<String> {
+        if !Self::env_flag("SGLANG_ROUTER_DUALPATH_ENABLE") {
+            return None;
+        }
+        Some(
+            env::var("SGLANG_ROUTER_DUALPATH_MODE")
+                .unwrap_or_else(|_| "prefill_only".to_string()),
+        )
+    }
+
+    fn aggregate_snapshot_metric(snapshot: &Value, pointer: &str) -> i64 {
+        if let Some(entries) = snapshot.as_array() {
+            return entries
+                .iter()
+                .map(|entry| entry.pointer(pointer).and_then(|v| v.as_i64()).unwrap_or(0))
+                .sum();
+        }
+        snapshot
+            .pointer(pointer)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    }
+
+    async fn fetch_worker_load_snapshot(&self, worker: &dyn Worker) -> Option<Value> {
+        let url = format!("{}/get_loads", worker.url());
+        let mut request = self.client.get(url);
+        if let Some(api_key) = worker.api_key() {
+            request = request.bearer_auth(api_key);
+        }
+        request
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()
+    }
+
+    async fn select_dualpath_path(
+        &self,
+        configured_mode: &str,
+        prefill_worker: &Arc<dyn Worker>,
+        decode_worker: &Arc<dyn Worker>,
+    ) -> String {
+        match configured_mode {
+            "decode_only" => return "de_read".to_string(),
+            "prefill_only" => return "pe_read".to_string(),
+            "hybrid_auto" => {}
+            _ => return "pe_read".to_string(),
+        }
+
+        let (prefill_snapshot, decode_snapshot) = tokio::join!(
+            self.fetch_worker_load_snapshot(prefill_worker.as_ref()),
+            self.fetch_worker_load_snapshot(decode_worker.as_ref())
+        );
+
+        let Some(prefill_snapshot) = prefill_snapshot else {
+            return "pe_read".to_string();
+        };
+        let Some(decode_snapshot) = decode_snapshot else {
+            return "pe_read".to_string();
+        };
+
+        let prefill_pressure = Self::aggregate_snapshot_metric(
+            &prefill_snapshot,
+            "/hicache/prefetch_queue_ops",
+        ) + Self::aggregate_snapshot_metric(
+            &prefill_snapshot,
+            "/disaggregation/prefill_prealloc_queue_reqs",
+        ) + Self::aggregate_snapshot_metric(
+            &prefill_snapshot,
+            "/disaggregation/prefill_inflight_queue_reqs",
+        );
+
+        let decode_pressure = Self::aggregate_snapshot_metric(
+            &decode_snapshot,
+            "/disaggregation/decode_storage_read_pending_reqs",
+        ) + Self::aggregate_snapshot_metric(
+            &decode_snapshot,
+            "/disaggregation/decode_offload_pending_reqs",
+        ) + Self::aggregate_snapshot_metric(
+            &decode_snapshot,
+            "/disaggregation/decode_backup_pending_reqs",
+        ) + Self::aggregate_snapshot_metric(&decode_snapshot, "/hicache/backup_queue_ops");
+
+        if prefill_pressure > decode_pressure + 2 {
+            "de_read".to_string()
+        } else {
+            "pe_read".to_string()
+        }
+    }
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -271,6 +379,71 @@ impl PDRouter {
                 Value::from(super::pd_types::generate_room_id()),
             );
         }
+        Ok(original)
+    }
+
+    fn inject_dualpath_into_value(
+        mut original: Value,
+        dualpath_mode: &str,
+        selected_path: &str,
+        decode_worker: &dyn Worker,
+        decode_bootstrap_port: Option<u16>,
+        batch_size: Option<usize>,
+    ) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if let Some(n) = batch_size {
+            obj.insert(
+                Self::DUALPATH_MODE_KEY.to_string(),
+                Value::Array((0..n).map(|_| Value::from(dualpath_mode)).collect()),
+            );
+            obj.insert(
+                Self::DUALPATH_SELECTED_PATH_KEY.to_string(),
+                Value::Array((0..n).map(|_| Value::from(selected_path)).collect()),
+            );
+            obj.insert(
+                Self::DUALPATH_DECODE_BOOTSTRAP_HOST_KEY.to_string(),
+                Value::Array(
+                    (0..n)
+                        .map(|_| Value::from(decode_worker.bootstrap_host()))
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                Self::DUALPATH_DECODE_BOOTSTRAP_PORT_KEY.to_string(),
+                Value::Array(
+                    (0..n)
+                        .map(|_| match decode_bootstrap_port {
+                            Some(v) => Value::from(v),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                ),
+            );
+        } else {
+            obj.insert(
+                Self::DUALPATH_MODE_KEY.to_string(),
+                Value::from(dualpath_mode),
+            );
+            obj.insert(
+                Self::DUALPATH_SELECTED_PATH_KEY.to_string(),
+                Value::from(selected_path),
+            );
+            obj.insert(
+                Self::DUALPATH_DECODE_BOOTSTRAP_HOST_KEY.to_string(),
+                Value::from(decode_worker.bootstrap_host()),
+            );
+            obj.insert(
+                Self::DUALPATH_DECODE_BOOTSTRAP_PORT_KEY.to_string(),
+                match decode_bootstrap_port {
+                    Some(v) => Value::from(v),
+                    None => Value::Null,
+                },
+            );
+        }
+
         Ok(original)
     }
 
@@ -340,6 +513,26 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+
+                        if let Some(dualpath_mode) = Self::configured_dualpath_mode() {
+                            let selected_path = self
+                                .select_dualpath_path(&dualpath_mode, &prefill, &decode)
+                                .await;
+                            json_request = match Self::inject_dualpath_into_value(
+                                json_request,
+                                &dualpath_mode,
+                                &selected_path,
+                                decode.as_ref(),
+                                decode
+                                    .bootstrap_port()
+                                    .or(prefill.bootstrap_port().map(|port| port + 1))
+                                    .or(Some(8999)),
+                                context.batch_size,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                        }
 
                         let response = self
                             .execute_dual_dispatch_internal(
@@ -1575,5 +1768,97 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[test]
+    fn test_inject_dualpath_into_value_single_request() {
+        let payload = json!({"text": "hello"});
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        let updated = PDRouter::inject_dualpath_into_value(
+            payload,
+            "hybrid_auto",
+            "de_read",
+            decode_worker.as_ref(),
+            Some(8998),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated.get("dualpath_mode").and_then(|v| v.as_str()),
+            Some("hybrid_auto")
+        );
+        assert_eq!(
+            updated
+                .get("dualpath_selected_path")
+                .and_then(|v| v.as_str()),
+            Some("de_read")
+        );
+        assert_eq!(
+            updated
+                .get("dualpath_decode_bootstrap_host")
+                .and_then(|v| v.as_str()),
+            Some("decode")
+        );
+        assert_eq!(
+            updated
+                .get("dualpath_decode_bootstrap_port")
+                .and_then(|v| v.as_u64()),
+            Some(8998)
+        );
+    }
+
+    #[test]
+    fn test_inject_dualpath_into_value_batch_request() {
+        let payload = json!({"text": ["a", "b"]});
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        let updated = PDRouter::inject_dualpath_into_value(
+            payload,
+            "hybrid_auto",
+            "pe_read",
+            decode_worker.as_ref(),
+            Some(8998),
+            Some(2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated
+                .pointer("/dualpath_mode/0")
+                .and_then(|v| v.as_str()),
+            Some("hybrid_auto")
+        );
+        assert_eq!(
+            updated
+                .pointer("/dualpath_selected_path/1")
+                .and_then(|v| v.as_str()),
+            Some("pe_read")
+        );
+        assert_eq!(
+            updated
+                .pointer("/dualpath_decode_bootstrap_host/0")
+                .and_then(|v| v.as_str()),
+            Some("decode")
+        );
+        assert_eq!(
+            updated
+                .pointer("/dualpath_decode_bootstrap_port/1")
+                .and_then(|v| v.as_u64()),
+            Some(8998)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_snapshot_metric_across_dp_entries() {
+        let snapshot = json!([
+            {"hicache": {"prefetch_queue_ops": 3}},
+            {"hicache": {"prefetch_queue_ops": 4}}
+        ]);
+        assert_eq!(
+            PDRouter::aggregate_snapshot_metric(&snapshot, "/hicache/prefetch_queue_ops"),
+            7
+        );
     }
 }

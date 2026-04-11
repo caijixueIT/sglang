@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, KVTransferDirection
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -197,8 +197,11 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        self.enable_staging = (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and self.transfer_direction == KVTransferDirection.PREFILL_TO_DECODE.value
+        )
+        if self.is_sender_role:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -246,7 +249,7 @@ class MooncakeKVManager(CommonKVManager):
                     ),
                     daemon=True,
                 ).start()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif self.is_receiver_role:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -1560,7 +1563,7 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert self.is_sender_role
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (

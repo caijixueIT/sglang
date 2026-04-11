@@ -131,6 +131,15 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_prefetch_queue_ops: int = 0
+    hicache_backup_queue_ops: int = 0
+    hicache_ack_load_queue_ops: int = 0
+    hicache_ack_backup_queue_ops: int = 0
+    hicache_prefetch_tokens_occupied: int = 0
+    decode_offload_pending_reqs: int = 0
+    decode_backup_pending_reqs: int = 0
+    decode_storage_read_pending_reqs: int = 0
+    decode_storage_read_hit_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -639,8 +648,11 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
-        # HiCache host-tier metrics (only created when hierarchical cache is enabled)
-        if self.enable_hierarchical_cache:
+        # HiCache / decode-offload metrics
+        if self.enable_hierarchical_cache or (
+            server_args is not None
+            and server_args.disaggregation_decode_enable_offload_kvcache
+        ):
             self.hicache_host_used_tokens = Gauge(
                 name="sglang:hicache_host_used_tokens",
                 documentation="Number of tokens currently used in the host KV cache.",
@@ -650,6 +662,60 @@ class SchedulerMetricsCollector:
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_prefetch_queue_ops = Gauge(
+                name="sglang:hicache_prefetch_queue_ops",
+                documentation="HiCache storage prefetch queue depth.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_backup_queue_ops = Gauge(
+                name="sglang:hicache_backup_queue_ops",
+                documentation="HiCache storage backup queue depth.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_ack_load_queue_ops = Gauge(
+                name="sglang:hicache_ack_load_queue_ops",
+                documentation="HiCache device-load ack queue depth.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_ack_backup_queue_ops = Gauge(
+                name="sglang:hicache_ack_backup_queue_ops",
+                documentation="HiCache backup ack queue depth.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_prefetch_tokens_occupied = Gauge(
+                name="sglang:hicache_prefetch_tokens_occupied",
+                documentation="HiCache tokens reserved by prefetch operations.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.decode_offload_pending_reqs = Gauge(
+                name="sglang:decode_offload_pending_reqs",
+                documentation="Decode-side KV offload requests in progress.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.decode_backup_pending_reqs = Gauge(
+                name="sglang:decode_backup_pending_reqs",
+                documentation="Decode-side KV backup requests in progress.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.decode_storage_read_pending_reqs = Gauge(
+                name="sglang:decode_storage_read_pending_reqs",
+                documentation="Decode-side storage read requests in progress.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.decode_storage_read_hit_tokens = Gauge(
+                name="sglang:decode_storage_read_hit_tokens",
+                documentation="Decode-side storage read hit tokens.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1040,13 +1106,43 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
-        # HiCache host-tier metrics (only logged if hierarchical cache is enabled)
-        if self.enable_hierarchical_cache:
+        # HiCache / decode-offload metrics
+        if hasattr(self, "hicache_host_used_tokens"):
             self._log_gauge(
                 self.hicache_host_used_tokens, stats.hicache_host_used_tokens
             )
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
+            self._log_gauge(
+                self.hicache_prefetch_queue_ops, stats.hicache_prefetch_queue_ops
+            )
+            self._log_gauge(
+                self.hicache_backup_queue_ops, stats.hicache_backup_queue_ops
+            )
+            self._log_gauge(
+                self.hicache_ack_load_queue_ops, stats.hicache_ack_load_queue_ops
+            )
+            self._log_gauge(
+                self.hicache_ack_backup_queue_ops, stats.hicache_ack_backup_queue_ops
+            )
+            self._log_gauge(
+                self.hicache_prefetch_tokens_occupied,
+                stats.hicache_prefetch_tokens_occupied,
+            )
+            self._log_gauge(
+                self.decode_offload_pending_reqs, stats.decode_offload_pending_reqs
+            )
+            self._log_gauge(
+                self.decode_backup_pending_reqs, stats.decode_backup_pending_reqs
+            )
+            self._log_gauge(
+                self.decode_storage_read_pending_reqs,
+                stats.decode_storage_read_pending_reqs,
+            )
+            self._log_gauge(
+                self.decode_storage_read_hit_tokens,
+                stats.decode_storage_read_hit_tokens,
             )
 
         self._log_gauge(

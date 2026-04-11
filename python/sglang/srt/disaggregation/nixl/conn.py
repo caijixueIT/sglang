@@ -188,7 +188,7 @@ class NixlKVManager(CommonKVManager):
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
         agent_config = nixl_agent_config(
             backends=[backend],
-            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+            num_threads=(8 if self.is_sender_role else 0),
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
 
@@ -202,9 +202,9 @@ class NixlKVManager(CommonKVManager):
 
         self.register_buffer_to_engine()
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.is_sender_role:
             self._start_bootstrap_thread()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif self.is_receiver_role:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
@@ -869,7 +869,7 @@ class NixlKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert self.is_sender_role
         assert not is_last or (is_last and aux_index is not None)
 
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()

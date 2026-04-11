@@ -47,6 +47,35 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_dualpath_requires_pd_mode(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", dualpath_enable=True)._handle_pd_disaggregation()
+        self.assertIn("dualpath-enable", str(context.exception))
+
+    def test_dualpath_decode_mode_is_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            dualpath_enable=True,
+            dualpath_static_mode="hybrid_auto",
+            dualpath_layer_streaming_chunk_pages=8,
+            dualpath_ib_traffic_class="8",
+        )
+        self.assertTrue(server_args.dualpath_enable)
+        self.assertEqual(server_args.dualpath_static_mode, "hybrid_auto")
+        self.assertEqual(server_args.dualpath_layer_streaming_chunk_pages, 8)
+        self.assertEqual(server_args.dualpath_ib_traffic_class, "8")
+        self.assertEqual(server_args.get_dualpath_decode_bootstrap_port(), 8999)
+
+    def test_dualpath_decode_bootstrap_port_override_is_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            dualpath_enable=True,
+            dualpath_decode_bootstrap_port=19001,
+        )
+        self.assertEqual(server_args.get_dualpath_decode_bootstrap_port(), 19001)
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")

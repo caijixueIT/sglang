@@ -5,11 +5,12 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
-from sglang_router.router import policy_from_str
+from sglang_router.router import Router, policy_from_str
 from sglang_router.sglang_router_rs import PolicyType
 
 
@@ -37,6 +38,8 @@ class TestRouterConfigValidation:
             host="127.0.0.1",
             port=30000,
             pd_disaggregation=True,
+            dualpath_enable=True,
+            dualpath_mode="hybrid_auto",
             prefill_urls=[
                 ("http://prefill1:8000", 9000),
                 ("http://prefill2:8000", None),
@@ -52,6 +55,24 @@ class TestRouterConfigValidation:
         ]
         assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert args.policy == "cache_aware"
+        assert args.dualpath_enable is True
+        assert args.dualpath_mode == "hybrid_auto"
+
+    def test_router_from_args_sets_dualpath_env(self):
+        """Test that DualPath config is propagated to the Rust router via env."""
+        args = RouterArgs(
+            pd_disaggregation=True,
+            dualpath_enable=True,
+            dualpath_mode="decode_only",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("sglang_router.router._Router") as router_ctor:
+                router_ctor.return_value = MagicMock()
+                Router.from_args(args)
+                assert os.environ["SGLANG_ROUTER_DUALPATH_ENABLE"] == "1"
+                assert os.environ["SGLANG_ROUTER_DUALPATH_MODE"] == "decode_only"
+                router_ctor.assert_called_once()
 
     def test_pd_config_without_urls_allowed(self):
         """Test that PD mode without URLs is now allowed (URLs are optional)."""

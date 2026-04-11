@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import KVTransferDirection
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -128,6 +129,11 @@ class PrefillBootstrapQueue:
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.reverse_kv_manager = (
+            self._init_reverse_kv_manager()
+            if self.scheduler.server_args.dualpath_enable
+            else None
+        )
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
@@ -171,6 +177,8 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_traffic_class = self.scheduler.server_args.dualpath_ib_traffic_class
+        kv_args.transfer_direction = KVTransferDirection.PREFILL_TO_DECODE.value
         kv_args.gpu_id = self.scheduler.gpu_id
 
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
@@ -223,6 +231,74 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                 )
         return kv_manager
+
+    def _init_reverse_kv_manager(self) -> CommonKVManager:
+        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args = kv_args_class()
+        kv_args.engine_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            self.token_to_kv_pool.get_contiguous_buf_infos()
+        )
+        kv_args.kv_data_ptrs = kv_data_ptrs
+        kv_args.kv_data_lens = kv_data_lens
+        kv_args.kv_item_lens = kv_item_lens
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
+        kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_traffic_class = self.scheduler.server_args.dualpath_ib_traffic_class
+        kv_args.transfer_direction = KVTransferDirection.DECODE_TO_PREFILL.value
+        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.state_data_ptrs = []
+        kv_args.state_data_lens = []
+        kv_args.state_item_lens = []
+        kv_args.state_type = "none"
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        return kv_manager_class(
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.scheduler.server_args,
+            self.is_mla_backend,
+        )
+
+    def create_reverse_receiver(self, req: Req):
+        if (
+            self.reverse_kv_manager is None
+            or req.dualpath_decode_bootstrap_host is None
+            or req.bootstrap_room is None
+        ):
+            return None
+
+        backend = (
+            TransferBackend.FAKE
+            if req.dualpath_decode_bootstrap_host == FAKE_BOOTSTRAP_HOST
+            else self.transfer_backend
+        )
+        kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
+        bootstrap_port = req.dualpath_decode_bootstrap_port or self.bootstrap_port
+        bootstrap_addr = f"{req.dualpath_decode_bootstrap_host}:{bootstrap_port}"
+        if (
+            backend != TransferBackend.FAKE
+            and not self.reverse_kv_manager.try_ensure_parallel_info(bootstrap_addr)
+        ):
+            return None
+
+        kv_receiver = kv_receiver_class(
+            mgr=self.reverse_kv_manager,
+            bootstrap_addr=bootstrap_addr,
+            bootstrap_room=req.bootstrap_room,
+        )
+        kv_receiver.init(0)
+        return kv_receiver
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if self._check_if_req_exceed_kv_capacity(req):

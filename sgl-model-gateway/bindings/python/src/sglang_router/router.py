@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
@@ -211,6 +212,13 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args)
+        if args.dualpath_enable:
+            os.environ["SGLANG_ROUTER_DUALPATH_ENABLE"] = "1"
+            os.environ["SGLANG_ROUTER_DUALPATH_MODE"] = args.dualpath_mode
+        else:
+            os.environ.pop("SGLANG_ROUTER_DUALPATH_ENABLE", None)
+            os.environ.pop("SGLANG_ROUTER_DUALPATH_MODE", None)
+
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
@@ -286,6 +294,8 @@ class Router:
         fields_to_remove = [
             "mini_lb",
             "test_external_dp_routing",
+            "dualpath_enable",
+            "dualpath_mode",
             "oracle_wallet_path",
             "oracle_tns_alias",
             "oracle_connect_descriptor",

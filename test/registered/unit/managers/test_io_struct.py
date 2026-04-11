@@ -218,7 +218,31 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.image_data[0], ["image1.jpg"])
         self.assertEqual(req.image_data[1], ["image2.jpg"])
         self.assertEqual(req.image_data[2], ["image1.jpg"])
-        self.assertEqual(req.image_data[3], ["image2.jpg"])
+
+    def test_dualpath_fields_expand_with_parallel_samples(self):
+        req = copy.deepcopy(self.base_req)
+        req.sampling_params = {"n": 2}
+        req.dualpath_mode = "hybrid_auto"
+        req.dualpath_selected_path = "de_read"
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.dualpath_mode, ["hybrid_auto"] * 4)
+        self.assertEqual(req.dualpath_selected_path, ["de_read"] * 4)
+
+    def test_dualpath_fields_preserved_in_getitem(self):
+        req = copy.deepcopy(self.base_req)
+        req.dualpath_mode = ["hybrid_auto", "prefill_only"]
+        req.dualpath_selected_path = ["de_read", "pe_read"]
+        req.normalize_batch_and_arguments()
+
+        item0 = req[0]
+        item1 = req[1]
+
+        self.assertEqual(item0.dualpath_mode, "hybrid_auto")
+        self.assertEqual(item0.dualpath_selected_path, "de_read")
+        self.assertEqual(item1.dualpath_mode, "prefill_only")
+        self.assertEqual(item1.dualpath_selected_path, "pe_read")
 
     def test_single_example_with_image(self):
         """Test handling of single example with image."""

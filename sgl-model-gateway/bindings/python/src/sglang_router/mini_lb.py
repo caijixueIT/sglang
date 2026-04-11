@@ -47,6 +47,8 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.dualpath_enable = router_args.dualpath_enable
+        self.dualpath_mode = router_args.dualpath_mode
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
@@ -110,6 +112,47 @@ class MiniLoadBalancer:
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
         )
+
+    def _select_dualpath_path(self) -> str:
+        if self.dualpath_mode == "decode_only":
+            return "de_read"
+        if self.dualpath_mode == "hybrid_auto":
+            return "de_read"
+        return "pe_read"
+
+    def _inject_dualpath_request_metadata(
+        self, request: dict, decode_server: str, bootstrap_port: Optional[int]
+    ) -> None:
+        if not self.dualpath_enable:
+            return
+
+        parsed_decode = urllib.parse.urlparse(decode_server)
+        decode_host = maybe_wrap_ipv6_address(parsed_decode.hostname)
+        decode_bootstrap_port = (
+            (bootstrap_port + 1) if bootstrap_port is not None else 8999
+        )
+        selected_path = self._select_dualpath_path()
+        batch_size = _get_request_batch_size(request)
+
+        if batch_size is not None:
+            request.update(
+                {
+                    "dualpath_mode": [self.dualpath_mode] * batch_size,
+                    "dualpath_selected_path": [selected_path] * batch_size,
+                    "dualpath_decode_bootstrap_host": [decode_host] * batch_size,
+                    "dualpath_decode_bootstrap_port": [decode_bootstrap_port]
+                    * batch_size,
+                }
+            )
+        else:
+            request.update(
+                {
+                    "dualpath_mode": self.dualpath_mode,
+                    "dualpath_selected_path": selected_path,
+                    "dualpath_decode_bootstrap_host": decode_host,
+                    "dualpath_decode_bootstrap_port": decode_bootstrap_port,
+                }
+            )
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -382,6 +425,10 @@ async def handle_generate_request(request_data: dict):
             }
         )
 
+    lb._inject_dualpath_request_metadata(
+        modified_request, decode_server, bootstrap_port
+    )
+
     if request_data.get("stream", False):
         return await lb.generate_stream(
             modified_request, prefill_server, decode_server, "generate"
@@ -405,6 +452,9 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             "bootstrap_port": bootstrap_port,
             "bootstrap_room": _generate_bootstrap_room(),
         }
+    )
+    lb._inject_dualpath_request_metadata(
+        modified_request, decode_server, bootstrap_port
     )
 
     if request_data.get("stream", False):

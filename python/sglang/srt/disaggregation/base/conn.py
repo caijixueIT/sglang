@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -10,6 +11,11 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+
+
+class KVTransferDirection(str, Enum):
+    PREFILL_TO_DECODE = "prefill_to_decode"
+    DECODE_TO_PREFILL = "decode_to_prefill"
 
 
 class KVArgs:
@@ -37,6 +43,7 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    transfer_direction: str = KVTransferDirection.PREFILL_TO_DECODE.value
 
 
 class KVPoll:

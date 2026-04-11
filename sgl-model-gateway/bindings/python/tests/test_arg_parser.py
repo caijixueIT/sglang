@@ -31,6 +31,10 @@ class TestRouterArgs:
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
+        assert args.dualpath_enable is False
+        assert args.dualpath_mode == "prefill_only"
+        assert args.dualpath_enable is False
+        assert args.dualpath_mode == "prefill_only"
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -447,6 +451,9 @@ class TestParseRouterArgs:
         """Test parsing PD disaggregated mode arguments."""
         args = [
             "--pd-disaggregation",
+            "--dualpath-enable",
+            "--dualpath-mode",
+            "decode_only",
             "--prefill",
             "http://prefill1:8000",
             "9000",
@@ -473,6 +480,8 @@ class TestParseRouterArgs:
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
         assert router_args.decode_policy == "round_robin"
+        assert router_args.dualpath_enable is True
+        assert router_args.dualpath_mode == "decode_only"
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
