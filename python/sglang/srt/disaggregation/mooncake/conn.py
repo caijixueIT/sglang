@@ -8,7 +8,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -202,6 +202,7 @@ class MooncakeKVManager(CommonKVManager):
             and self.transfer_direction == KVTransferDirection.PREFILL_TO_DECODE.value
         )
         if self.is_sender_role:
+            self.pending_transfer_infos: dict = defaultdict(lambda: defaultdict(deque))
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -259,6 +260,23 @@ class MooncakeKVManager(CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _promote_pending_transfer_infos(self, room: int) -> None:
+        pending_room_infos = self.pending_transfer_infos.get(room)
+        if not pending_room_infos:
+            return
+
+        room_infos = self.transfer_infos.setdefault(room, {})
+        for mooncake_session_id, queued_infos in list(pending_room_infos.items()):
+            if mooncake_session_id in room_infos:
+                continue
+            if queued_infos:
+                room_infos[mooncake_session_id] = queued_infos.popleft()
+            if not queued_infos:
+                pending_room_infos.pop(mooncake_session_id, None)
+
+        if not pending_room_infos:
+            self.pending_transfer_infos.pop(room, None)
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
@@ -1338,6 +1356,7 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                        self._promote_pending_transfer_infos(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1416,8 +1435,21 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    if mooncake_session_id in self.transfer_infos[room]:
+                        self.pending_transfer_infos[room][mooncake_session_id].append(
+                            transfer_info
+                        )
+                    else:
+                        self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    logger.info(
+                        "MooncakeTrace transfer_info room=%s endpoint=%s dst_port=%s session_id=%s required_dst_info_num=%s is_dummy=%s",
+                        room,
+                        transfer_info.endpoint,
+                        transfer_info.dst_port,
+                        transfer_info.mooncake_session_id,
+                        transfer_info.required_dst_info_num,
+                        transfer_info.is_dummy,
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
@@ -1826,6 +1858,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        kv_indices = np.asarray(kv_indices, dtype=np.int32)
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

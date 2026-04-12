@@ -43,13 +43,27 @@ class SchedulerOutputProcessorMixin:
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
-        storage_backend_type = "none"
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
-        if cache_controller and hasattr(cache_controller, "storage_backend"):
+        if cache_controller is not None:
+            storage_backend_type = getattr(
+                cache_controller, "storage_backend_type", None
+            )
+            if storage_backend_type:
+                return storage_backend_type
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
-                storage_backend_type = type(storage_backend).__name__
-        return storage_backend_type
+                configured_backend = getattr(
+                    getattr(self, "server_args", None),
+                    "hicache_storage_backend",
+                    None,
+                )
+                return configured_backend or type(storage_backend).__name__
+        configured_backend = getattr(
+            getattr(self, "server_args", None), "hicache_storage_backend", None
+        )
+        if configured_backend:
+            return configured_backend
+        return "none"
 
     def _get_cached_tokens_details(self: Scheduler, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
@@ -59,6 +73,10 @@ class SchedulerOutputProcessorMixin:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
+        should_trace_dualpath = (
+            getattr(req, "dualpath_selected_path", None) == "de_read"
+            or getattr(req, "cached_tokens_storage_path", None) == "decode"
+        )
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -68,17 +86,79 @@ class SchedulerOutputProcessorMixin:
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
-            # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
+            # Include storage details whenever the request carries an L3/storage
+            # breakdown, even if this worker does not own a storage backend
+            # locally (for example, decode-only dualpath responses).
+            if req.cached_tokens_storage > 0 or getattr(
+                self, "enable_hicache_storage", False
+            ):
                 details["storage"] = req.cached_tokens_storage
-                details["storage_backend"] = self._get_storage_backend_type()
+                storage_backend_type = self._get_storage_backend_type()
+                if storage_backend_type != "none":
+                    details["storage_backend"] = storage_backend_type
+                if req.cached_tokens_storage > 0 and req.cached_tokens_storage_path:
+                    details["storage_path"] = req.cached_tokens_storage_path
+            if should_trace_dualpath:
+                logger.info(
+                    "DualPathTrace %s",
+                    {
+                        "stage": "build_cached_tokens_details",
+                        "rid": req.rid,
+                        "bootstrap_room": getattr(req, "bootstrap_room", None),
+                        "disaggregation_mode": getattr(
+                            self, "disaggregation_mode", None
+                        ),
+                        "cached_tokens": req.cached_tokens,
+                        "cached_tokens_device": req.cached_tokens_device,
+                        "cached_tokens_host": req.cached_tokens_host,
+                        "cached_tokens_storage": req.cached_tokens_storage,
+                        "cached_tokens_storage_path": req.cached_tokens_storage_path,
+                        "details": details,
+                    },
+                )
             return details
 
         if req.cached_tokens > 0:
-            return {
+            details = {
                 "device": req.cached_tokens,
                 "host": 0,
             }
+            if should_trace_dualpath:
+                logger.info(
+                    "DualPathTrace %s",
+                    {
+                        "stage": "build_cached_tokens_details",
+                        "rid": req.rid,
+                        "bootstrap_room": getattr(req, "bootstrap_room", None),
+                        "disaggregation_mode": getattr(
+                            self, "disaggregation_mode", None
+                        ),
+                        "cached_tokens": req.cached_tokens,
+                        "cached_tokens_device": req.cached_tokens_device,
+                        "cached_tokens_host": req.cached_tokens_host,
+                        "cached_tokens_storage": req.cached_tokens_storage,
+                        "cached_tokens_storage_path": req.cached_tokens_storage_path,
+                        "details": details,
+                    },
+                )
+            return details
+
+        if should_trace_dualpath:
+            logger.info(
+                "DualPathTrace %s",
+                {
+                    "stage": "build_cached_tokens_details",
+                    "rid": req.rid,
+                    "bootstrap_room": getattr(req, "bootstrap_room", None),
+                    "disaggregation_mode": getattr(self, "disaggregation_mode", None),
+                    "cached_tokens": req.cached_tokens,
+                    "cached_tokens_device": req.cached_tokens_device,
+                    "cached_tokens_host": req.cached_tokens_host,
+                    "cached_tokens_storage": req.cached_tokens_storage,
+                    "cached_tokens_storage_path": req.cached_tokens_storage_path,
+                    "details": None,
+                },
+            )
 
         return None
 

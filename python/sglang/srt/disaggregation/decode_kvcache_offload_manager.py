@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
@@ -39,6 +40,8 @@ class DecodeStorageReadSession:
     operation: object
     started_at: float
     requested_tokens: int
+    bootstrap_addr: str | None = None
+    bootstrap_room: int | None = None
 
 
 class DecodeKVCacheOffloadManager:
@@ -314,6 +317,7 @@ class DecodeKVCacheOffloadManager:
         req: "Req",
         token_ids: list[int] | None = None,
         prefix_keys: list[str] | None = None,
+        last_hash: str | None = None,
     ) -> bool:
         """Prefetch page-aligned request prefix from L3 into decode host memory."""
         if not self.cache_controller.enable_storage:
@@ -340,6 +344,7 @@ class DecodeKVCacheOffloadManager:
             req_id,
             host_indices,
             read_tokens[:aligned_len],
+            last_hash=last_hash,
             prefix_keys=prefix_keys,
         )
         self.ongoing_storage_reads[req_id] = DecodeStorageReadSession(
@@ -348,6 +353,12 @@ class DecodeKVCacheOffloadManager:
             operation=operation,
             started_at=time.time(),
             requested_tokens=aligned_len,
+            bootstrap_addr=(
+                f"{req.bootstrap_host}:{req.bootstrap_port}"
+                if req.bootstrap_host is not None and req.bootstrap_port is not None
+                else None
+            ),
+            bootstrap_room=req.bootstrap_room,
         )
         return True
 
@@ -371,6 +382,17 @@ class DecodeKVCacheOffloadManager:
                     self.storage_read_hit_tokens_total += hit_tokens
                 else:
                     self.decode_host_mem_pool.free(session.host_indices)
+                if (
+                    session.bootstrap_addr is not None
+                    and session.bootstrap_room is not None
+                ):
+                    CommonKVManager.register_dualpath_read_status(
+                        session.bootstrap_addr,
+                        session.bootstrap_room,
+                        decode_storage_read_started=True,
+                        decode_storage_read_completed=True,
+                        decode_storage_read_hit_tokens=hit_tokens,
+                    )
                 completed_req_ids.append(req_id)
 
         for req_id in completed_req_ids:

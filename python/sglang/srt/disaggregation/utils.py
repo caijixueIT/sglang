@@ -248,12 +248,16 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+        self.cached_tokens[req.metadata_buffer_index][4] = (
+            1
+            if req.cached_tokens_storage_path == "prefill"
+            else 2 if req.cached_tokens_storage_path == "decode" else 0
+        )
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

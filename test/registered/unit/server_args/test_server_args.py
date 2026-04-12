@@ -59,11 +59,13 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dualpath_enable=True,
             dualpath_static_mode="hybrid_auto",
             dualpath_layer_streaming_chunk_pages=8,
+            dualpath_prefill_reverse_wait_budget_s=0.2,
             dualpath_ib_traffic_class="8",
         )
         self.assertTrue(server_args.dualpath_enable)
         self.assertEqual(server_args.dualpath_static_mode, "hybrid_auto")
         self.assertEqual(server_args.dualpath_layer_streaming_chunk_pages, 8)
+        self.assertEqual(server_args.dualpath_prefill_reverse_wait_budget_s, 0.2)
         self.assertEqual(server_args.dualpath_ib_traffic_class, "8")
         self.assertEqual(server_args.get_dualpath_decode_bootstrap_port(), 8999)
 
@@ -75,6 +77,16 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dualpath_decode_bootstrap_port=19001,
         )
         self.assertEqual(server_args.get_dualpath_decode_bootstrap_port(), 19001)
+
+    def test_dualpath_prefill_reverse_wait_budget_must_be_non_negative(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="prefill",
+                dualpath_enable=True,
+                dualpath_prefill_reverse_wait_budget_s=-0.1,
+            )._handle_pd_disaggregation()
+        self.assertIn("dualpath-prefill-reverse-wait-budget-s", str(context.exception))
 
 
 class TestPortArgs(unittest.TestCase):

@@ -94,6 +94,56 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _resolve_reverse_host_pool(
+    tree_cache: BasePrefixCache, decode_offload_manager
+):
+    # Storage-read completions return indices allocated from decode_host_mem_pool,
+    # so the reverse sender must be initialized against the same host pool.
+    return getattr(decode_offload_manager, "decode_host_mem_pool", None) or getattr(
+        tree_cache, "token_to_kv_pool_host", None
+    ) or getattr(tree_cache, "full_kv_pool_host", None)
+
+
+def _resolve_reverse_prefill_start_layer(reverse_host_pool) -> int:
+    return getattr(reverse_host_pool, "start_layer", 0)
+
+
+def _append_unique_req(active_reqs: List["Req"], seen_rids: set[str], req: Optional["Req"]):
+    if req is None or req.rid in seen_rids:
+        return
+    seen_rids.add(req.rid)
+    active_reqs.append(req)
+
+
+def _log_dualpath_req_state(
+    req: "Req", stage: str, extra: Optional[Dict[str, object]] = None
+) -> None:
+    if (
+        getattr(req, "dualpath_selected_path", None) != "de_read"
+        and getattr(req, "cached_tokens_storage_path", None) != "decode"
+    ):
+        return
+
+    payload: Dict[str, object] = {
+        "stage": stage,
+        "rid": getattr(req, "rid", None),
+        "bootstrap_room": getattr(req, "bootstrap_room", None),
+        "output_len": len(getattr(req, "output_ids", [])),
+        "cached_tokens": getattr(req, "cached_tokens", None),
+        "cached_tokens_device": getattr(req, "cached_tokens_device", None),
+        "cached_tokens_host": getattr(req, "cached_tokens_host", None),
+        "cached_tokens_storage": getattr(req, "cached_tokens_storage", None),
+        "cached_tokens_storage_path": getattr(req, "cached_tokens_storage_path", None),
+        "reverse_ready": getattr(req, "dualpath_decode_reverse_transfer_ready", None),
+        "reverse_completed": getattr(
+            req, "dualpath_decode_reverse_transfer_completed", None
+        ),
+    }
+    if extra:
+        payload.update(extra)
+    logger.info("DualPathTrace %s", payload)
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -303,8 +353,9 @@ class DecodePreallocQueue:
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
         self.reverse_transfer_queue: List[Req] = []
-        self.reverse_host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
-            self.tree_cache, "full_kv_pool_host", None
+        self.reverse_host_pool = _resolve_reverse_host_pool(
+            self.tree_cache,
+            getattr(self.scheduler, "decode_offload_manager", None),
         )
         self.reverse_kv_manager = (
             self._init_reverse_kv_manager()
@@ -425,6 +476,9 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % attn_tp_size
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.prefill_start_layer = _resolve_reverse_prefill_start_layer(
+            self.reverse_host_pool
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.reverse_host_pool.get_contiguous_buf_infos()
         )
@@ -457,28 +511,173 @@ class DecodePreallocQueue:
         )
 
     def _dualpath_sender_has_metadata(self, req: Req) -> bool:
-        if req.dualpath_reverse_sender is None or req.bootstrap_room is None:
+        if req.bootstrap_room is None:
             return False
-        transfer_infos = getattr(req.dualpath_reverse_sender.kv_mgr, "transfer_infos", None)
+        kv_mgr = (
+            getattr(req.dualpath_reverse_sender, "kv_mgr", None)
+            if req.dualpath_reverse_sender is not None
+            else self.reverse_kv_manager
+        )
+        transfer_infos = getattr(kv_mgr, "transfer_infos", None)
         if transfer_infos is None:
             return True
         return req.bootstrap_room in transfer_infos
 
+    def _dualpath_current_transfer_infos(self, req: Req):
+        if req.bootstrap_room is None:
+            return None
+        kv_mgr = (
+            getattr(req.dualpath_reverse_sender, "kv_mgr", None)
+            if req.dualpath_reverse_sender is not None
+            else self.reverse_kv_manager
+        )
+        transfer_infos = getattr(kv_mgr, "transfer_infos", None)
+        if transfer_infos is None:
+            return None
+        return transfer_infos.get(req.bootstrap_room)
+
+    def _dualpath_current_dst_page_count(self, req: Req) -> int:
+        room_infos = self._dualpath_current_transfer_infos(req)
+        if not room_infos:
+            return 0
+        page_counts = [
+            len(info.dst_kv_indices)
+            for info in room_infos.values()
+            if not getattr(info, "is_dummy", False)
+        ]
+        if not page_counts:
+            page_counts = [len(info.dst_kv_indices) for info in room_infos.values()]
+        return min(page_counts) if page_counts else 0
+
+    def _clear_reverse_sender_state(self, req: Req) -> None:
+        sender = req.dualpath_reverse_sender
+        if sender is not None and hasattr(sender, "clear"):
+            sender.clear()
+        kv_mgr = getattr(sender, "kv_mgr", None) or self.reverse_kv_manager
+        if kv_mgr is not None and req.bootstrap_room is not None:
+            for attr in ("required_prefill_response_num_table", "prefill_response_tracker"):
+                table = getattr(kv_mgr, attr, None)
+                if table is not None:
+                    table.pop(req.bootstrap_room, None)
+        req.dualpath_reverse_sender = None
+        req.dualpath_reverse_send_started = False
+        req.dualpath_reverse_current_chunk_pages = 0
+        req.dualpath_reverse_current_chunk_tokens = 0
+
+    def _release_reverse_source(self, req: Req) -> None:
+        host_indices = (
+            req.dualpath_reverse_source_indices[0]
+            if req.dualpath_reverse_source_indices is not None
+            else None
+        )
+        if host_indices is not None:
+            self.reverse_host_pool.free(host_indices)
+        if req.dualpath_reverse_sender_aux_index >= 0:
+            self.req_to_metadata_buffer_idx_allocator.free(
+                req.dualpath_reverse_sender_aux_index
+            )
+            req.dualpath_reverse_sender_aux_index = -1
+        req.dualpath_reverse_source_indices = None
+        req.dualpath_reverse_source_tokens = 0
+        req.dualpath_reverse_source_page_offset = 0
+        req.dualpath_reverse_source_token_offset = 0
+
+    def _maybe_prepare_next_reverse_sender_chunk(self, req: Req) -> bool:
+        if (
+            req.dualpath_reverse_sender is not None
+            or req.dualpath_reverse_source_indices is None
+            or req.bootstrap_room is None
+        ):
+            return req.dualpath_reverse_sender is not None
+
+        source_page_indices = req.dualpath_reverse_source_indices[1]
+        page_offset = int(getattr(req, "dualpath_reverse_source_page_offset", 0))
+        remaining_pages = len(source_page_indices) - page_offset
+        if remaining_pages <= 0:
+            return False
+
+        dst_page_count = self._dualpath_current_dst_page_count(req)
+        if dst_page_count <= 0 and getattr(self.reverse_kv_manager, "transfer_infos", None) is None:
+            dst_page_count = remaining_pages
+        if dst_page_count <= 0:
+            return False
+
+        send_pages = min(remaining_pages, dst_page_count)
+        token_offset = int(getattr(req, "dualpath_reverse_source_token_offset", 0))
+        remaining_tokens = max(0, req.dualpath_reverse_source_tokens - token_offset)
+        chunk_tokens = min(remaining_tokens, send_pages * self.reverse_host_pool.page_size)
+        if chunk_tokens <= 0:
+            return False
+
+        if req.dualpath_reverse_sender_aux_index < 0:
+            req.dualpath_reverse_sender_aux_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            if req.dualpath_reverse_sender_aux_index is None:
+                return False
+
+        self.metadata_buffers.cached_tokens[req.dualpath_reverse_sender_aux_index][
+            0
+        ] = chunk_tokens
+
+        backend = (
+            TransferBackend.FAKE
+            if req.dualpath_decode_bootstrap_host == FAKE_BOOTSTRAP_HOST
+            else self.transfer_backend
+        )
+        kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
+        bootstrap_port = req.dualpath_decode_bootstrap_port or self.bootstrap_port
+        sender = kv_sender_class(
+            mgr=self.reverse_kv_manager,
+            bootstrap_addr=f"{req.dualpath_decode_bootstrap_host}:{bootstrap_port}",
+            bootstrap_room=req.bootstrap_room,
+            dest_tp_ranks=[self.tp_rank],
+            pp_rank=self.pp_rank,
+        )
+        sender.init(send_pages, req.dualpath_reverse_sender_aux_index)
+        if self._dualpath_sender_has_metadata(req) and hasattr(
+            self.reverse_kv_manager, "request_status"
+        ):
+            self.reverse_kv_manager.request_status[req.bootstrap_room] = (
+                KVPoll.WaitingForInput
+            )
+        req.dualpath_reverse_sender = sender
+        req.dualpath_reverse_current_chunk_pages = send_pages
+        req.dualpath_reverse_current_chunk_tokens = chunk_tokens
+        req.dualpath_reverse_send_started = False
+        return True
+
     def process_reverse_transfers(self):
+        decode_offload_manager = getattr(self.scheduler, "decode_offload_manager", None)
+        if decode_offload_manager is None:
+            return
+
+        self._maybe_start_dualpath_storage_reads()
+
         if (
             self.reverse_kv_manager is None
             or self.reverse_host_pool is None
-            or getattr(self.scheduler, "decode_offload_manager", None) is None
         ):
             return
 
-        active_reqs = [
-            decode_req.req for decode_req in self.queue
-        ] + [
-            decode_req.req for decode_req in self.pending_reqs
-        ] + [
-            decode_req.req for decode_req in self.transfer_queue.queue
-        ]
+        active_reqs: List[Req] = []
+        seen_rids: set[str] = set()
+        for decode_req in self.queue:
+            _append_unique_req(active_reqs, seen_rids, decode_req.req)
+        for decode_req in self.pending_reqs:
+            _append_unique_req(active_reqs, seen_rids, decode_req.req)
+        for decode_req in self.transfer_queue.queue:
+            _append_unique_req(active_reqs, seen_rids, decode_req.req)
+        for req in getattr(self.scheduler, "waiting_queue", []):
+            _append_unique_req(active_reqs, seen_rids, req)
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        if running_batch is not None:
+            for req in getattr(running_batch, "reqs", []):
+                _append_unique_req(active_reqs, seen_rids, req)
+        last_batch = getattr(self.scheduler, "last_batch", None)
+        if last_batch is not None:
+            for req in getattr(last_batch, "reqs", []):
+                _append_unique_req(active_reqs, seen_rids, req)
 
         page_size = self.reverse_host_pool.page_size
         for req in active_reqs:
@@ -493,9 +692,7 @@ class DecodePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
-            completed = self.scheduler.decode_offload_manager.take_completed_storage_read(
-                req.rid
-            )
+            completed = decode_offload_manager.take_completed_storage_read(req.rid)
             if completed is None:
                 continue
 
@@ -504,44 +701,51 @@ class DecodePreallocQueue:
                 self.reverse_host_pool.free(host_indices)
                 continue
 
-            backend = (
-                TransferBackend.FAKE
-                if req.dualpath_decode_bootstrap_host == FAKE_BOOTSTRAP_HOST
-                else self.transfer_backend
+            # Surface decode-side storage hits on the decode request immediately so
+            # prompt usage can reflect them even if the reverse prefill merge
+            # metadata arrives later than the decode response path.
+            req.cached_tokens = max(getattr(req, "cached_tokens", 0), hit_tokens)
+            req.cached_tokens_storage = max(
+                getattr(req, "cached_tokens_storage", 0), hit_tokens
             )
-            kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
-            req.dualpath_reverse_sender_aux_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
+            req.cached_tokens_storage_path = "decode"
+            _log_dualpath_req_state(
+                req,
+                "decode_storage_read_completed",
+                extra={"storage_read_hit_tokens": hit_tokens},
             )
-            if req.dualpath_reverse_sender_aux_index is None:
-                self.reverse_host_pool.free(host_indices)
-                break
-
-            self.metadata_buffers.cached_tokens[req.dualpath_reverse_sender_aux_index][
-                0
-            ] = hit_tokens
             req.dualpath_reverse_source_indices = (
                 host_indices,
                 kv_to_page_indices(host_indices[:hit_tokens].cpu().numpy(), page_size),
             )
             req.dualpath_reverse_source_tokens = hit_tokens
+            req.dualpath_reverse_source_page_offset = 0
+            req.dualpath_reverse_source_token_offset = 0
+            req.dualpath_reverse_current_chunk_pages = 0
+            req.dualpath_reverse_current_chunk_tokens = 0
             req.dualpath_reverse_send_started = False
-            bootstrap_port = req.dualpath_decode_bootstrap_port or self.bootstrap_port
-            req.dualpath_reverse_sender = kv_sender_class(
-                mgr=self.reverse_kv_manager,
-                bootstrap_addr=f"{req.dualpath_decode_bootstrap_host}:{bootstrap_port}",
-                bootstrap_room=req.bootstrap_room,
-                dest_tp_ranks=[self.tp_rank],
-                pp_rank=self.pp_rank,
-            )
-            req.dualpath_reverse_sender.init(
-                len(req.dualpath_reverse_source_indices[1]),
-                req.dualpath_reverse_sender_aux_index,
-            )
-            self.reverse_transfer_queue.append(req)
+            req.dualpath_reverse_transfer_done = False
+            req.dualpath_decode_reverse_transfer_ready = False
+            req.dualpath_decode_reverse_transfer_completed = False
+            if req.dualpath_reverse_sender_aux_index < 0:
+                req.dualpath_reverse_sender_aux_index = (
+                    self.req_to_metadata_buffer_idx_allocator.alloc()
+                )
+            if req.dualpath_reverse_sender_aux_index is None:
+                self.reverse_host_pool.free(host_indices)
+                req.dualpath_reverse_source_indices = None
+                req.dualpath_reverse_source_tokens = 0
+                break
+            if req not in self.reverse_transfer_queue:
+                self.reverse_transfer_queue.append(req)
 
         remaining: List[Req] = []
         for req in self.reverse_transfer_queue:
+            if not self._maybe_prepare_next_reverse_sender_chunk(req):
+                if req.dualpath_reverse_source_indices is not None:
+                    remaining.append(req)
+                continue
+
             sender = req.dualpath_reverse_sender
             if sender is None:
                 continue
@@ -551,7 +755,38 @@ class DecodePreallocQueue:
                 and not req.dualpath_reverse_send_started
                 and self._dualpath_sender_has_metadata(req)
             ):
-                sender.send(req.dualpath_reverse_source_indices[1])
+                req.dualpath_decode_reverse_transfer_ready = True
+                CommonKVManager.register_dualpath_read_status(
+                    _bootstrap_addr(req),
+                    req.bootstrap_room,
+                    decode_storage_read_started=True,
+                    decode_storage_read_completed=True,
+                    decode_storage_read_hit_tokens=req.dualpath_reverse_current_chunk_tokens,
+                    decode_reverse_transfer_ready=True,
+                )
+                bootstrap_port = (
+                    req.dualpath_decode_bootstrap_port or self.bootstrap_port
+                )
+                bootstrap_addr = (
+                    f"{req.dualpath_decode_bootstrap_host}:{bootstrap_port}"
+                )
+                _log_dualpath_req_state(
+                    req,
+                    "decode_reverse_send_issued",
+                    extra={
+                        "aux_idx": req.dualpath_reverse_sender_aux_index,
+                        "page_count": req.dualpath_reverse_current_chunk_pages,
+                        "bootstrap_addr": bootstrap_addr,
+                    },
+                )
+                page_offset = int(
+                    getattr(req, "dualpath_reverse_source_page_offset", 0)
+                )
+                sender.send(
+                    req.dualpath_reverse_source_indices[1][
+                        page_offset : page_offset + req.dualpath_reverse_current_chunk_pages
+                    ]
+                )
                 req.dualpath_reverse_send_started = True
                 remaining.append(req)
                 continue
@@ -559,23 +794,118 @@ class DecodePreallocQueue:
                 remaining.append(req)
                 continue
 
-            host_indices = (
-                req.dualpath_reverse_source_indices[0]
-                if req.dualpath_reverse_source_indices is not None
-                else None
-            )
-            if host_indices is not None:
-                self.reverse_host_pool.free(host_indices)
-            if req.dualpath_reverse_sender_aux_index >= 0:
-                self.req_to_metadata_buffer_idx_allocator.free(
-                    req.dualpath_reverse_sender_aux_index
+            fully_sent = False
+            if poll == KVPoll.Success:
+                req.dualpath_reverse_source_page_offset = int(
+                    getattr(req, "dualpath_reverse_source_page_offset", 0)
+                ) + req.dualpath_reverse_current_chunk_pages
+                req.dualpath_reverse_source_token_offset = int(
+                    getattr(req, "dualpath_reverse_source_token_offset", 0)
+                ) + req.dualpath_reverse_current_chunk_tokens
+                source_page_indices = (
+                    req.dualpath_reverse_source_indices[1]
+                    if req.dualpath_reverse_source_indices is not None
+                    else []
                 )
-                req.dualpath_reverse_sender_aux_index = -1
-            req.dualpath_reverse_source_indices = None
-            req.dualpath_reverse_transfer_done = poll == KVPoll.Success
-            req.dualpath_reverse_sender = None
+                fully_sent = (
+                    req.dualpath_reverse_source_page_offset >= len(source_page_indices)
+                    or req.dualpath_reverse_source_token_offset
+                    >= req.dualpath_reverse_source_tokens
+                )
+                req.dualpath_reverse_transfer_done = fully_sent
+                req.dualpath_decode_reverse_transfer_completed = fully_sent
+                if fully_sent:
+                    CommonKVManager.register_dualpath_read_status(
+                        _bootstrap_addr(req),
+                        req.bootstrap_room,
+                        decode_storage_read_started=True,
+                        decode_storage_read_completed=True,
+                        decode_storage_read_hit_tokens=req.dualpath_reverse_source_tokens,
+                        decode_reverse_transfer_ready=True,
+                        decode_reverse_transfer_completed=True,
+                    )
+            else:
+                req.dualpath_reverse_transfer_done = False
+            _log_dualpath_req_state(
+                req,
+                "decode_reverse_transfer_finalized",
+                extra={
+                    "final_poll": getattr(poll, "name", str(poll)),
+                    "sent_started": req.dualpath_reverse_send_started,
+                    "fully_sent": fully_sent,
+                },
+            )
+            self._clear_reverse_sender_state(req)
+            if poll == KVPoll.Success and not fully_sent:
+                remaining.append(req)
+                continue
+            if poll == KVPoll.Success:
+                self._release_reverse_source(req)
+                continue
+            self._release_reverse_source(req)
 
         self.reverse_transfer_queue = remaining
+
+    def _maybe_start_dualpath_storage_reads(self):
+        decode_offload_manager = getattr(self.scheduler, "decode_offload_manager", None)
+        if decode_offload_manager is None:
+            return
+
+        active_reqs = [
+            decode_req.req for decode_req in self.queue
+        ] + [
+            decode_req.req for decode_req in self.pending_reqs
+        ] + [
+            decode_req.req for decode_req in self.transfer_queue.queue
+        ]
+
+        reqs_by_bootstrap_addr: Dict[str, List[Req]] = {}
+        for req in active_reqs:
+            if (
+                req.dualpath_selected_path != "de_read"
+                or req.dualpath_decode_storage_read_requested
+                or req.dualpath_reverse_transfer_done
+                or req.bootstrap_room is None
+            ):
+                continue
+            reqs_by_bootstrap_addr.setdefault(_bootstrap_addr(req), []).append(req)
+
+        for bootstrap_addr, reqs in reqs_by_bootstrap_addr.items():
+            infos = CommonKVReceiver.query_dualpath_read_infos(
+                bootstrap_addr,
+                [req.bootstrap_room for req in reqs if req.bootstrap_room is not None],
+            )
+            for req in reqs:
+                info = infos.get(str(req.bootstrap_room))
+                if info is None:
+                    continue
+
+                matched_len = int(info.get("matched_len", 0))
+                aligned_total = (
+                    len(req.origin_input_ids) // decode_offload_manager.page_size
+                ) * decode_offload_manager.page_size
+                if matched_len >= aligned_total:
+                    req.dualpath_decode_storage_read_requested = True
+                    continue
+
+                if matched_len > 0 and not info.get("last_hash"):
+                    req.dualpath_decode_storage_read_requested = True
+                    continue
+
+                read_started = decode_offload_manager.start_storage_read(
+                    req,
+                    token_ids=req.origin_input_ids[matched_len:],
+                    prefix_keys=info.get("prefix_keys"),
+                    last_hash=info.get("last_hash"),
+                )
+                if read_started:
+                    req.dualpath_decode_storage_read_started = True
+                    CommonKVManager.register_dualpath_read_status(
+                        bootstrap_addr,
+                        req.bootstrap_room,
+                        decode_storage_read_started=True,
+                    )
+                    req.dualpath_decode_storage_read_requested = True
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -587,12 +917,6 @@ class DecodePreallocQueue:
             self.retracted_queue.append(req)
         else:
             decode_req = self._create_receiver_and_enqueue(req)
-
-            if (
-                req.dualpath_selected_path == "de_read"
-                and getattr(self.scheduler, "decode_offload_manager", None) is not None
-            ):
-                self.scheduler.decode_offload_manager.start_storage_read(req)
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
@@ -1217,10 +1541,44 @@ class DecodeTransferQueue:
 
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        metadata_cached_tokens = cached_tokens[0].item()
+        metadata_cached_tokens_device = cached_tokens[1].item()
+        metadata_cached_tokens_host = cached_tokens[2].item()
+        metadata_cached_tokens_storage = cached_tokens[3].item()
+        metadata_cached_tokens_storage_path = {
+            1: "prefill",
+            2: "decode",
+        }.get(cached_tokens[4].item())
+        preserve_decode_storage_details = (
+            metadata_cached_tokens == 0
+            and metadata_cached_tokens_device == 0
+            and metadata_cached_tokens_host == 0
+            and metadata_cached_tokens_storage == 0
+            and metadata_cached_tokens_storage_path is None
+            and getattr(decode_req.req, "cached_tokens_storage", 0) > 0
+            and getattr(decode_req.req, "cached_tokens_storage_path", None) == "decode"
+        )
+        if preserve_decode_storage_details:
+            decode_req.req.cached_tokens = max(
+                getattr(decode_req.req, "cached_tokens", 0),
+                getattr(decode_req.req, "cached_tokens_storage", 0),
+            )
+        else:
+            decode_req.req.cached_tokens = metadata_cached_tokens
+            decode_req.req.cached_tokens_device = metadata_cached_tokens_device
+            decode_req.req.cached_tokens_host = metadata_cached_tokens_host
+            decode_req.req.cached_tokens_storage = metadata_cached_tokens_storage
+            decode_req.req.cached_tokens_storage_path = (
+                metadata_cached_tokens_storage_path
+            )
+        _log_dualpath_req_state(
+            decode_req.req,
+            "decode_metadata_committed",
+            extra={
+                "metadata_cached_tokens_storage_path_raw": cached_tokens[4].item(),
+                "preserve_decode_storage_details": preserve_decode_storage_details,
+            },
+        )
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

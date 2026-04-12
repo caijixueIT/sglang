@@ -23,11 +23,7 @@ def start_disagg_service(
     ):
         # Default PD starts bootstrap on prefill. DualPath needs the symmetric
         # bootstrap service on decode as well for reverse transfer setup.
-        bootstrap_port = (
-            server_args.get_dualpath_decode_bootstrap_port()
-            if server_args.dualpath_enable and disagg_mode == DisaggregationMode.DECODE
-            else server_args.disaggregation_bootstrap_port
-        )
+        bootstrap_port = server_args.get_runtime_bootstrap_port(disagg_mode)
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )

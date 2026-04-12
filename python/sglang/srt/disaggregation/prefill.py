@@ -28,7 +28,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVTransferDirection
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -299,6 +299,99 @@ class PrefillBootstrapQueue:
         )
         kv_receiver.init(0)
         return kv_receiver
+
+    def _query_dualpath_read_info(self, req: Req) -> dict:
+        if (
+            req.bootstrap_room is None
+            or req.bootstrap_host is None
+            or req.bootstrap_port is None
+        ):
+            return {}
+
+        infos = CommonKVReceiver.query_dualpath_read_infos(
+            f"{req.bootstrap_host}:{req.bootstrap_port}",
+            [req.bootstrap_room],
+        )
+        info = infos.get(str(req.bootstrap_room), {})
+        if not info:
+            return {}
+
+        if "matched_len" in info:
+            req.dualpath_prefill_matched_len = int(info["matched_len"])
+        if "last_hash" in info:
+            req.dualpath_prefill_last_hash = info.get("last_hash")
+        if "prefix_keys" in info:
+            req.dualpath_prefill_prefix_keys = info.get("prefix_keys")
+        if "decode_storage_read_started" in info:
+            req.dualpath_decode_storage_read_started = bool(
+                info["decode_storage_read_started"]
+            )
+        if "decode_storage_read_completed" in info:
+            req.dualpath_decode_storage_read_completed = bool(
+                info["decode_storage_read_completed"]
+            )
+        if "decode_storage_read_hit_tokens" in info:
+            req.dualpath_decode_storage_read_hit_tokens = int(
+                info["decode_storage_read_hit_tokens"]
+            )
+        if "decode_reverse_transfer_ready" in info:
+            req.dualpath_decode_reverse_transfer_ready = bool(
+                info["decode_reverse_transfer_ready"]
+            )
+        if "decode_reverse_transfer_completed" in info:
+            req.dualpath_decode_reverse_transfer_completed = bool(
+                info["decode_reverse_transfer_completed"]
+            )
+        return info
+
+    def refresh_dualpath_reverse_status(self, req: Req) -> dict:
+        return self._query_dualpath_read_info(req)
+
+    def _is_dualpath_storage_read_unnecessary(self, req: Req, info: dict | None = None) -> bool:
+        info = info or {}
+        matched_len = int(info.get("matched_len", req.dualpath_prefill_matched_len))
+        last_hash = info.get("last_hash", req.dualpath_prefill_last_hash)
+        aligned_total = (
+            len(req.origin_input_ids) // self.scheduler.page_size
+        ) * self.scheduler.page_size
+        if matched_len >= aligned_total:
+            return True
+        return matched_len > 0 and not last_hash
+
+    def is_dualpath_reverse_stage_ready(self, req: Req) -> bool:
+        if req.dualpath_selected_path != "de_read":
+            return True
+
+        if self._is_dualpath_storage_read_unnecessary(req):
+            req.dualpath_decode_storage_read_requested = True
+            req.dualpath_decode_storage_read_completed = True
+            req.dualpath_decode_storage_read_hit_tokens = 0
+            return True
+
+        if req.dualpath_decode_storage_read_completed:
+            return True
+
+        info = self._query_dualpath_read_info(req)
+        if info and self._is_dualpath_storage_read_unnecessary(req, info):
+            req.dualpath_decode_storage_read_requested = True
+            req.dualpath_decode_storage_read_completed = True
+            req.dualpath_decode_storage_read_hit_tokens = 0
+            return True
+
+        if not info:
+            return False
+
+        return req.dualpath_decode_storage_read_completed
+
+    def get_dualpath_reverse_wait_budget_s(self, req: Req) -> float:
+        wait_budget_s = self.scheduler.server_args.dualpath_prefill_reverse_wait_budget_s
+        if wait_budget_s <= 0 or req.dualpath_selected_path != "de_read":
+            return 0.0
+        if not self.is_dualpath_reverse_stage_ready(req):
+            return 0.0
+        if req.dualpath_decode_storage_read_hit_tokens <= 0:
+            return 0.0
+        return wait_budget_s
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if self._check_if_req_exceed_kv_capacity(req):
@@ -846,7 +939,52 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
+            if (
+                getattr(req, "dualpath_selected_path", None) == "de_read"
+                or getattr(req, "cached_tokens_storage_path", None) == "decode"
+                or getattr(req, "storage_hit_length", 0) > 0
+            ):
+                logger.info(
+                    "DualPathTrace %s",
+                    {
+                        "stage": "prefill_before_set_buf",
+                        "rid": req.rid,
+                        "bootstrap_room": req.bootstrap_room,
+                        "cached_tokens": req.cached_tokens,
+                        "cached_tokens_device": req.cached_tokens_device,
+                        "cached_tokens_host": req.cached_tokens_host,
+                        "cached_tokens_storage": req.cached_tokens_storage,
+                        "cached_tokens_storage_path": req.cached_tokens_storage_path,
+                        "host_hit_length": req.host_hit_length,
+                        "storage_hit_length": req.storage_hit_length,
+                        "metadata_buffer_index": req.metadata_buffer_index,
+                    },
+                )
             self.disagg_metadata_buffers.set_buf(req)
+            if (
+                getattr(req, "dualpath_selected_path", None) == "de_read"
+                or getattr(req, "cached_tokens_storage_path", None) == "decode"
+                or getattr(req, "storage_hit_length", 0) > 0
+            ):
+                cached = self.disagg_metadata_buffers.cached_tokens[
+                    req.metadata_buffer_index
+                ]
+                logger.info(
+                    "DualPathTrace %s",
+                    {
+                        "stage": "prefill_after_set_buf",
+                        "rid": req.rid,
+                        "bootstrap_room": req.bootstrap_room,
+                        "metadata_buffer_index": req.metadata_buffer_index,
+                        "buffer_cached_tokens": int(cached[0].item()),
+                        "buffer_cached_tokens_device": int(cached[1].item()),
+                        "buffer_cached_tokens_host": int(cached[2].item()),
+                        "buffer_cached_tokens_storage": int(cached[3].item()),
+                        "buffer_cached_tokens_storage_path_raw": int(
+                            cached[4].item()
+                        ),
+                    },
+                )
 
             # Prepare extra pool indices for hybrid models
             if isinstance(

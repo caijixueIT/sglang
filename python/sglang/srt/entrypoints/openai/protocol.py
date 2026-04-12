@@ -110,6 +110,7 @@ class CachedTokensDetails(BaseModel):
     # L3 storage fields are only present when storage backend is enabled
     storage: Optional[int] = None  # Tokens from L3 storage backend
     storage_backend: Optional[str] = None  # Type of storage backend used
+    storage_path: Optional[Literal["prefill", "decode"]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -119,6 +120,8 @@ class CachedTokensDetails(BaseModel):
             data.pop("storage", None)
         if self.storage_backend is None:
             data.pop("storage_backend", None)
+        if self.storage_path is None:
+            data.pop("storage_path", None)
         return data
 
 

@@ -119,7 +119,9 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.bootstrap_port = server_args.get_runtime_bootstrap_port(
+            disaggregation_mode, self.transfer_direction
+        )
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -270,6 +272,44 @@ class CommonKVManager(BaseKVManager):
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    @staticmethod
+    def register_dualpath_read_status(
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        decode_storage_read_started: bool,
+        decode_storage_read_completed: Optional[bool] = None,
+        decode_storage_read_hit_tokens: Optional[int] = None,
+        decode_reverse_transfer_ready: Optional[bool] = None,
+        decode_reverse_transfer_completed: Optional[bool] = None,
+    ) -> bool:
+        url = f"http://{bootstrap_addr}/register_dualpath_read_status"
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "decode_storage_read_started": decode_storage_read_started,
+        }
+        if decode_storage_read_completed is not None:
+            payload["decode_storage_read_completed"] = decode_storage_read_completed
+        if decode_storage_read_hit_tokens is not None:
+            payload["decode_storage_read_hit_tokens"] = decode_storage_read_hit_tokens
+        if decode_reverse_transfer_ready is not None:
+            payload["decode_reverse_transfer_ready"] = decode_reverse_transfer_ready
+        if decode_reverse_transfer_completed is not None:
+            payload["decode_reverse_transfer_completed"] = (
+                decode_reverse_transfer_completed
+            )
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                return True
+            logger.error(
+                "Failed to register dualpath read status: %s, %s",
+                response.status_code,
+                response.text,
+            )
+        except Exception as e:
+            logger.error(f"Failed to register dualpath read status: {e}")
+        return False
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -490,6 +530,33 @@ class CommonKVSender(BaseKVSender):
         except Exception as e:
             logger.error(f"Failed to register prefill dp_rank: {e}")
 
+    def register_dualpath_read_info(
+        self,
+        matched_len: int,
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> bool:
+        """Register prefill-side match result for decode miss-tail reads."""
+        url = f"http://{self.bootstrap_server_url}/register_dualpath_read_info"
+        payload = {
+            "bootstrap_room": self.bootstrap_room,
+            "matched_len": matched_len,
+            "last_hash": last_hash,
+            "prefix_keys": prefix_keys,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                return True
+            logger.error(
+                "Failed to register dualpath read info: %s, %s",
+                response.status_code,
+                response.text,
+            )
+        except Exception as e:
+            logger.error(f"Failed to register dualpath read info: {e}")
+        return False
+
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
@@ -671,6 +738,30 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.error(f"Error querying dp_ranks from bootstrap: {e}")
             return {}
 
+    @staticmethod
+    def query_dualpath_read_infos(
+        bootstrap_addr: str, bootstrap_rooms: List[int]
+    ) -> Dict[str, dict]:
+        """Batch query prefill-side match metadata for decode miss-tail reads."""
+        try:
+            url = f"http://{bootstrap_addr}/query_dualpath_read_info"
+            response = requests.post(
+                url,
+                json={"bootstrap_rooms": bootstrap_rooms},
+                timeout=5,
+            )
+            if response.status_code == 200:
+                return response.json()
+            logger.error(
+                "Failed to query dualpath read info: %s, %s",
+                response.status_code,
+                response.text,
+            )
+            return {}
+        except Exception as e:
+            logger.error(f"Error querying dualpath read info from bootstrap: {e}")
+            return {}
+
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
         with cls._global_lock:
@@ -733,6 +824,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
+        self.room_to_dualpath_read_info: Dict[int, Dict[str, Union[int, float, str, List[str], None]]] = {}
         self._registered_count = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
@@ -763,6 +855,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
+        self.app.router.add_post(
+            "/register_dualpath_read_info", self._handle_register_dualpath_read_info
+        )
+        self.app.router.add_post(
+            "/register_dualpath_read_status", self._handle_register_dualpath_read_status
+        )
+        self.app.router.add_post(
+            "/query_dualpath_read_info", self._handle_query_dualpath_read_info
+        )
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
@@ -931,22 +1032,108 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     result[str(room_int)] = self.room_to_dp_rank[room_int]["dp_rank"]
         return web.json_response(result, status=200)
 
+    async def _handle_register_dualpath_read_info(self, request: web.Request):
+        data = await request.json()
+        bootstrap_room = int(data["bootstrap_room"])
+        matched_len = int(data["matched_len"])
+        last_hash = data.get("last_hash")
+        prefix_keys = data.get("prefix_keys")
+        async with self.lock:
+            self.room_to_dualpath_read_info[bootstrap_room] = {
+                "matched_len": matched_len,
+                "last_hash": last_hash,
+                "prefix_keys": prefix_keys,
+                "timestamp": time.time(),
+            }
+        logger.debug(
+            "Registered dualpath read info for bootstrap_room=%s matched_len=%s",
+            bootstrap_room,
+            matched_len,
+        )
+        return web.Response(text="OK", status=200)
+
+    async def _handle_register_dualpath_read_status(self, request: web.Request):
+        data = await request.json()
+        bootstrap_room = int(data["bootstrap_room"])
+        decode_storage_read_started = bool(data["decode_storage_read_started"])
+        decode_storage_read_completed = data.get("decode_storage_read_completed")
+        decode_storage_read_hit_tokens = data.get("decode_storage_read_hit_tokens")
+        decode_reverse_transfer_ready = data.get("decode_reverse_transfer_ready")
+        decode_reverse_transfer_completed = data.get(
+            "decode_reverse_transfer_completed"
+        )
+        async with self.lock:
+            entry = self.room_to_dualpath_read_info.setdefault(
+                bootstrap_room,
+                {"timestamp": time.time()},
+            )
+            entry["decode_storage_read_started"] = decode_storage_read_started
+            if decode_storage_read_completed is not None:
+                entry["decode_storage_read_completed"] = bool(
+                    decode_storage_read_completed
+                )
+            if decode_storage_read_hit_tokens is not None:
+                entry["decode_storage_read_hit_tokens"] = int(
+                    decode_storage_read_hit_tokens
+                )
+            if decode_reverse_transfer_ready is not None:
+                entry["decode_reverse_transfer_ready"] = bool(
+                    decode_reverse_transfer_ready
+                )
+            if decode_reverse_transfer_completed is not None:
+                entry["decode_reverse_transfer_completed"] = bool(
+                    decode_reverse_transfer_completed
+                )
+            entry["timestamp"] = time.time()
+        logger.debug(
+            "Registered dualpath read status for bootstrap_room=%s started=%s completed=%s hit_tokens=%s reverse_ready=%s reverse_completed=%s",
+            bootstrap_room,
+            decode_storage_read_started,
+            decode_storage_read_completed,
+            decode_storage_read_hit_tokens,
+            decode_reverse_transfer_ready,
+            decode_reverse_transfer_completed,
+        )
+        return web.Response(text="OK", status=200)
+
+    async def _handle_query_dualpath_read_info(self, request: web.Request):
+        data = await request.json()
+        bootstrap_rooms = data["bootstrap_rooms"]
+        result = {}
+        async with self.lock:
+            for room in bootstrap_rooms:
+                room_int = int(room)
+                if room_int in self.room_to_dualpath_read_info:
+                    info = dict(self.room_to_dualpath_read_info[room_int])
+                    info.pop("timestamp", None)
+                    result[str(room_int)] = info
+        return web.json_response(result, status=200)
+
     async def _cleanup_expired_entries(self):
-        """Remove entries older than cleanup interval from room_to_dp_rank."""
+        """Remove expired per-room bootstrap metadata."""
         while True:
             await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
             async with self.lock:
-                expired_keys = [
+                expired_dp_rank_keys = [
                     key
                     for key, value in self.room_to_dp_rank.items()
                     if current_time - value["timestamp"] > self.entry_cleanup_interval
                 ]
-                for key in expired_keys:
+                for key in expired_dp_rank_keys:
                     del self.room_to_dp_rank[key]
-            if expired_keys:
+                expired_dualpath_keys = [
+                    key
+                    for key, value in self.room_to_dualpath_read_info.items()
+                    if current_time - value["timestamp"] > self.entry_cleanup_interval
+                ]
+                for key in expired_dualpath_keys:
+                    del self.room_to_dualpath_read_info[key]
+            if expired_dp_rank_keys or expired_dualpath_keys:
                 logger.debug(
-                    f"Cleaned up {len(expired_keys)} expired entries from room_to_dp_rank"
+                    "Cleaned up %s expired dp_rank entries and %s expired dualpath entries",
+                    len(expired_dp_rank_keys),
+                    len(expired_dualpath_keys),
                 )
 
     def _run_server(self):

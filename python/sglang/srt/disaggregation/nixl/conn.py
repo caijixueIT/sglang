@@ -1114,6 +1114,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        kv_indices = np.asarray(kv_indices, dtype=np.int32)
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",

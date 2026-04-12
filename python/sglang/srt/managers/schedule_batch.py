@@ -111,6 +111,60 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+def _log_dualpath_req_state(
+    req: "Req", stage: str, extra: Optional[dict] = None
+) -> None:
+    if (
+        getattr(req, "dualpath_selected_path", None) != "de_read"
+        and getattr(req, "cached_tokens_storage_path", None) != "decode"
+        and getattr(req, "storage_hit_length", 0) <= 0
+    ):
+        return
+
+    payload = {
+        "stage": stage,
+        "rid": getattr(req, "rid", None),
+        "bootstrap_room": getattr(req, "bootstrap_room", None),
+        "cached_tokens": getattr(req, "cached_tokens", None),
+        "cached_tokens_device": getattr(req, "cached_tokens_device", None),
+        "cached_tokens_host": getattr(req, "cached_tokens_host", None),
+        "cached_tokens_storage": getattr(req, "cached_tokens_storage", None),
+        "cached_tokens_storage_path": getattr(req, "cached_tokens_storage_path", None),
+        "host_hit_length": getattr(req, "host_hit_length", None),
+        "storage_hit_length": getattr(req, "storage_hit_length", None),
+        "prefix_len": len(getattr(req, "prefix_indices", [])),
+        "already_computed": getattr(req, "already_computed", None),
+        "cache_breakdown_computed": getattr(req, "_cache_breakdown_computed", None),
+    }
+    if extra:
+        payload.update(extra)
+    logger.info("DualPathTrace %s", payload)
+
+
+def _refresh_cached_token_breakdown(
+    req: "Req", cached_total: Optional[int] = None
+) -> None:
+    if cached_total is None:
+        cached_total = req.cached_tokens
+    cached_total = max(int(cached_total), 0)
+
+    host_total = min(req.host_hit_length, cached_total)
+    # Clamp storage to host_total to handle edge cases
+    storage_portion = min(host_total, req.storage_hit_length)
+    host_portion = host_total - storage_portion
+    device_portion = max(0, cached_total - host_total)
+
+    req.cached_tokens_device = device_portion
+    req.cached_tokens_host = host_portion
+    req.cached_tokens_storage = storage_portion
+    req.cached_tokens_storage_path = (
+        req.cached_tokens_storage_path
+        if storage_portion > 0 and req.cached_tokens_storage_path is not None
+        else ("prefill" if storage_portion > 0 else None)
+    )
+    req._cache_breakdown_computed = True
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -821,6 +875,7 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.cached_tokens_storage_path: Optional[str] = None
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
@@ -871,8 +926,22 @@ class Req(ReqDllmMixin):
         self.dualpath_reverse_receiver_aux_index: int = -1
         self.dualpath_reverse_source_indices = None
         self.dualpath_reverse_source_tokens: int = 0
+        self.dualpath_reverse_source_page_offset: int = 0
+        self.dualpath_reverse_source_token_offset: int = 0
+        self.dualpath_reverse_current_chunk_pages: int = 0
+        self.dualpath_reverse_current_chunk_tokens: int = 0
         self.dualpath_reverse_send_started: bool = False
         self.dualpath_reverse_transfer_done: bool = False
+        self.dualpath_prefill_matched_len: int = 0
+        self.dualpath_prefill_last_hash: Optional[str] = None
+        self.dualpath_prefill_prefix_keys: Optional[List[str]] = None
+        self.dualpath_prefill_match_registered: bool = False
+        self.dualpath_decode_storage_read_requested: bool = False
+        self.dualpath_decode_storage_read_started: bool = False
+        self.dualpath_decode_storage_read_completed: bool = False
+        self.dualpath_decode_storage_read_hit_tokens: int = 0
+        self.dualpath_decode_reverse_transfer_ready: bool = False
+        self.dualpath_decode_reverse_transfer_completed: bool = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -990,11 +1059,10 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
-        if self.return_logprob and self.logprob_start_len >= 0:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-        max_prefix_len = max(max_prefix_len, 0)
+        # NOTE: the matched length is at most 1 less than the input length to
+        # enable the downstream forward to produce logits for the final prompt
+        # token.
+        max_prefix_len = self.get_max_prefix_len(input_len)
         token_ids = self.fill_ids[:max_prefix_len]
 
         # Disable prefix caching when embed overrides are present: same token IDs
@@ -1298,6 +1366,16 @@ class Req(ReqDllmMixin):
             self.extend_input_len,
         )
 
+    def get_max_prefix_len(self, input_len: Optional[int] = None) -> int:
+        if input_len is None:
+            input_len = len(self.fill_ids)
+        max_prefix_len = input_len - 1
+        if self.return_logprob and self.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.positional_embed_overrides is not None:
+            max_prefix_len = 0
+        return max(max_prefix_len, 0)
+
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
@@ -1523,15 +1601,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             "create_reverse_receiver",
             None,
         )
+        reverse_wait_budget_getter = getattr(
+            getattr(scheduler, "disagg_prefill_bootstrap_queue", None),
+            "get_dualpath_reverse_wait_budget_s",
+            None,
+        )
+        reverse_status_refresher = getattr(
+            getattr(scheduler, "disagg_prefill_bootstrap_queue", None),
+            "refresh_dualpath_reverse_status",
+            None,
+        )
         if reverse_factory is None:
             return out_cache_loc
 
         allocator = getattr(scheduler, "req_to_metadata_buffer_idx_allocator", None)
-        if allocator is None:
+        if allocator is None or reverse_wait_budget_getter is None:
             return out_cache_loc
 
         page_size = self.tree_cache.page_size
-        wait_budget_s = 0.05
         cursor = 0
         out_slices: list[torch.Tensor] = []
         updated = False
@@ -1545,13 +1632,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             can_try_reverse = (
                 req.dualpath_selected_path == "de_read"
-                and prefix_len == 0
-                and req.host_hit_length == 0
                 and req.bootstrap_room is not None
                 and req.dualpath_decode_bootstrap_host is not None
-                and extend_len == seq_len
+                and extend_len > 0
             )
             if not can_try_reverse:
+                if req.dualpath_selected_path == "de_read":
+                    _log_dualpath_req_state(
+                        req,
+                        "prefill_reverse_merge_skipped",
+                        extra={
+                            "extend_len": extend_len,
+                            "is_chunked": req.is_chunked,
+                            "has_bootstrap_room": req.bootstrap_room is not None,
+                            "has_decode_bootstrap_host": (
+                                req.dualpath_decode_bootstrap_host is not None
+                            ),
+                        },
+                    )
+                out_slices.append(req_slice)
+                continue
+
+            wait_budget_s = reverse_wait_budget_getter(req)
+            if wait_budget_s <= 0:
                 out_slices.append(req_slice)
                 continue
 
@@ -1561,7 +1664,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             req.dualpath_reverse_receiver = receiver
 
-            max_hit_tokens = min((len(req.origin_input_ids) // page_size) * page_size, extend_len)
+            max_hit_tokens = min(
+                (len(req.origin_input_ids) // page_size) * page_size, extend_len
+            )
+            max_reverse_prefix_capacity = req.get_max_prefix_len(seq_len) - prefix_len
+            max_hit_tokens = min(max_hit_tokens, max(max_reverse_prefix_capacity, 0))
             if max_hit_tokens <= 0 or allocator.available_size() == 0:
                 out_slices.append(req_slice)
                 continue
@@ -1577,11 +1684,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 page_size,
             )
             receiver.send_metadata(dst_page_indices, aux_idx)
+            _log_dualpath_req_state(
+                req,
+                "prefill_reverse_wait_start",
+                extra={
+                    "wait_budget_s": wait_budget_s,
+                    "max_hit_tokens": max_hit_tokens,
+                    "aux_idx": aux_idx,
+                    "dst_page_count": len(dst_page_indices),
+                },
+            )
 
             hit_tokens = 0
-            deadline = time.time() + wait_budget_s
-            while time.time() < deadline:
+            sender_started_deadline = time.time() + wait_budget_s
+            completion_deadline = None
+            next_status_refresh_at = 0.0
+            last_poll = None
+            while True:
                 poll = receiver.poll()
+                last_poll = poll
                 if poll == KVPoll.Success:
                     hit_tokens = int(
                         scheduler.disagg_metadata_buffers.cached_tokens[aux_idx][0].item()
@@ -1589,7 +1710,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     break
                 if poll == KVPoll.Failed:
                     break
+                now = time.time()
+                if (
+                    reverse_status_refresher is not None
+                    and now >= next_status_refresh_at
+                ):
+                    reverse_status_refresher(req)
+                    next_status_refresh_at = now + 0.01
+                if completion_deadline is None and (
+                    req.dualpath_decode_reverse_transfer_ready
+                    or req.dualpath_decode_reverse_transfer_completed
+                ):
+                    completion_deadline = now + wait_budget_s
+                deadline = (
+                    completion_deadline
+                    if completion_deadline is not None
+                    else sender_started_deadline
+                )
+                if now >= deadline:
+                    break
                 time.sleep(0.001)
+
+            _log_dualpath_req_state(
+                req,
+                "prefill_reverse_wait_done",
+                extra={
+                    "wait_budget_s": wait_budget_s,
+                    "max_hit_tokens": max_hit_tokens,
+                    "aux_idx": aux_idx,
+                    "last_poll": getattr(last_poll, "name", str(last_poll)),
+                    "hit_tokens": hit_tokens,
+                    "reverse_ready": req.dualpath_decode_reverse_transfer_ready,
+                    "reverse_completed": req.dualpath_decode_reverse_transfer_completed,
+                },
+            )
 
             if hasattr(receiver, "clear"):
                 receiver.clear()
@@ -1603,15 +1757,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
 
             req.req_pool_idx = req_pool_idx
-            prefix_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :hit_tokens
+            reverse_prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, prefix_len : prefix_len + hit_tokens
             ].to(torch.int64)
-            req.prefix_indices = prefix_indices
-            req.host_hit_length = hit_tokens
-            req.storage_hit_length = max(req.storage_hit_length, hit_tokens)
-            req.set_extend_input_len(len(req.fill_ids) - hit_tokens)
+            req.prefix_indices = torch.cat(
+                [req.prefix_indices, reverse_prefix_indices], dim=0
+            )
+            req.host_hit_length += hit_tokens
+            req.storage_hit_length += hit_tokens
+            req.cached_tokens_storage_path = "decode"
+            _refresh_cached_token_breakdown(
+                req,
+                cached_total=max(
+                    req.cached_tokens,
+                    len(req.prefix_indices) - req.already_computed,
+                ),
+            )
+            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
             req.kv_committed_len = len(req.fill_ids)
             req.kv_allocated_len = len(req.fill_ids)
+            _log_dualpath_req_state(
+                req,
+                "prefill_reverse_merge_applied",
+                extra={"reverse_hit_tokens": hit_tokens},
+            )
             updated = True
             out_slices.append(req_slice[hit_tokens:])
 
@@ -1838,24 +2007,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
                     # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
-                    req._cache_breakdown_computed = True
+                    # via init_load_back in schedule_policy or reverse merged from
+                    # decode.
+                    _refresh_cached_token_breakdown(req)
+                    _log_dualpath_req_state(
+                        req,
+                        "prefill_cache_breakdown_computed",
+                        extra={
+                            "pre_len": pre_len,
+                            "seq_len": seq_len,
+                            "host_total": req.host_hit_length,
+                            "storage_portion": req.cached_tokens_storage,
+                            "host_portion": req.cached_tokens_host,
+                            "device_portion": req.cached_tokens_device,
+                        },
+                    )
+                elif (
+                    req.dualpath_selected_path == "de_read"
+                    or req.storage_hit_length > 0
+                ):
+                    _refresh_cached_token_breakdown(req)
+                    _log_dualpath_req_state(
+                        req,
+                        "prefill_cache_breakdown_refreshed",
+                        extra={"pre_len": pre_len, "seq_len": seq_len},
+                    )
 
                 req.already_computed = seq_len
             req.is_retracted = False

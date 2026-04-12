@@ -814,6 +814,14 @@ class HiCacheController:
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
+    def revoke_prefetch(self, operation: PrefetchOperation, storage_hit_count: int):
+        operation.mark_terminate()
+        self.prefetch_revoke_queue.put(operation.request_id)
+        self.append_host_mem_release(operation.host_indices)
+        logger.debug(
+            f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+        )
+
     def append_host_mem_release(self, host_indices: torch.Tensor):
         if host_indices.numel() == 0:
             return
@@ -1008,11 +1016,7 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
+                    self.revoke_prefetch(operation, storage_hit_count)
                 else:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)

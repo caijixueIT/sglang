@@ -1990,6 +1990,15 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and self.server_args.dualpath_enable
+                    and req.dualpath_selected_path == "de_read"
+                ):
+                    req.dualpath_prefill_matched_len = matched_len
+                    req.dualpath_prefill_last_hash = last_hash
+                    req.dualpath_prefill_prefix_keys = prefix_keys
+                    return
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
@@ -1997,6 +2006,24 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+
+    def _register_dualpath_read_info(self, req: Req):
+        if (
+            not self.server_args.dualpath_enable
+            or req.dualpath_selected_path != "de_read"
+            or req.dualpath_prefill_match_registered
+            or req.bootstrap_room is None
+        ):
+            return
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is None or not hasattr(sender, "register_dualpath_read_info"):
+            return
+        if sender.register_dualpath_read_info(
+            matched_len=req.dualpath_prefill_matched_len,
+            last_hash=req.dualpath_prefill_last_hash,
+            prefix_keys=req.dualpath_prefill_prefix_keys,
+        ):
+            req.dualpath_prefill_match_registered = True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2012,6 +2039,7 @@ class Scheduler(
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
+            self._register_dualpath_read_info(req)
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
@@ -2484,6 +2512,16 @@ class Scheduler(
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
+
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and self.server_args.dualpath_enable
+                and req.dualpath_selected_path == "de_read"
+                and not self.disagg_prefill_bootstrap_queue.is_dualpath_reverse_stage_ready(
+                    req
+                )
+            ):
+                continue
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)

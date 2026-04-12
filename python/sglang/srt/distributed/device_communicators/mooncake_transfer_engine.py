@@ -120,6 +120,14 @@ class MooncakeTransferEngine:
         self.session_id = NetworkAddress(
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
+        logger.info(
+            "MooncakeTrace init hostname=%s gpu_id=%s ib_device=%s rpc_port=%s session_id=%s",
+            self.hostname,
+            self.gpu_id,
+            self.ib_device,
+            self.engine.get_rpc_port(),
+            self.session_id,
+        )
 
     def register(self, ptr, length):
         try:

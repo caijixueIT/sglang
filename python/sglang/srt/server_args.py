@@ -713,6 +713,7 @@ class ServerArgs:
         "prefill_only"
     )
     dualpath_layer_streaming_chunk_pages: int = 16
+    dualpath_prefill_reverse_wait_budget_s: float = 0.05
     dualpath_ib_traffic_class: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
@@ -3493,6 +3494,10 @@ class ServerArgs:
             raise ValueError(
                 "The argument dualpath-layer-streaming-chunk-pages must be positive."
             )
+        if self.dualpath_prefill_reverse_wait_budget_s < 0:
+            raise ValueError(
+                "The argument dualpath-prefill-reverse-wait-budget-s must be non-negative."
+            )
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
@@ -3522,6 +3527,21 @@ class ServerArgs:
         if self.dualpath_decode_bootstrap_port is not None:
             return self.dualpath_decode_bootstrap_port
         return self.disaggregation_bootstrap_port + 1
+
+    def get_runtime_bootstrap_port(
+        self, disaggregation_mode, transfer_direction: Optional[str] = None
+    ) -> int:
+        mode = (
+            disaggregation_mode.value
+            if hasattr(disaggregation_mode, "value")
+            else str(disaggregation_mode)
+        )
+        if self.dualpath_enable and (
+            transfer_direction == "decode_to_prefill"
+            or (transfer_direction is None and mode == "decode")
+        ):
+            return self.get_dualpath_decode_bootstrap_port()
+        return self.disaggregation_bootstrap_port
 
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
@@ -6129,6 +6149,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dualpath_layer_streaming_chunk_pages,
             help="Experimental chunk size, in pages, for DualPath layer streaming.",
+        )
+        parser.add_argument(
+            "--dualpath-prefill-reverse-wait-budget-s",
+            type=float,
+            default=ServerArgs.dualpath_prefill_reverse_wait_budget_s,
+            help="Max seconds a prefill request waits for confirmed decode->prefill reverse KV before falling back to regular prefill.",
         )
         parser.add_argument(
             "--dualpath-ib-traffic-class",

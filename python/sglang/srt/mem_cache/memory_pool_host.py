@@ -336,6 +336,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
 
+    def get_contiguous_buf_infos(self):
+        """Return (data_ptrs, data_lens, item_lens) for RDMA registration."""
+        data_refs = self.k_data_refs + self.v_data_refs
+        data_ptrs = [
+            int(self.k_data_ptrs[i].item()) for i in range(self.layer_num)
+        ] + [int(self.v_data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [tensor.nbytes for tensor in data_refs]
+        item_lens = [self.token_stride_size] * len(data_refs)
+        return data_ptrs, data_lens, item_lens
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim

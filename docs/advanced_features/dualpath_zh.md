@@ -32,10 +32,9 @@
 DualPath 通过新增两条能力来解决这个问题：
 
 1. `storage -> decode`
-   允许 decode 直接从 L3 storage 读取 KV 到 host buffer，并直接消费这些 KV。
-
+  允许 decode 直接从 L3 storage 读取 KV 到 host buffer，并直接消费这些 KV。
 2. `decode -> prefill`
-   允许 decode 将可复用的 prompt KV 反向传回 prefill，从而减少 prefill 需要重新计算的 prompt 部分。
+  允许 decode 将可复用的 prompt KV 反向传回 prefill，从而减少 prefill 需要重新计算的 prompt 部分。
 
 ## 3. 当前实现范围
 
@@ -75,19 +74,15 @@ DualPath 通过新增两条能力来解决这个问题：
 这些概念在 SGLang 中的映射如下：
 
 - PD Disaggregation
-  天然提供 prefill 与 decode 的角色拆分。
-
+天然提供 prefill 与 decode 的角色拆分。
 - HiCache
-  提供 GPU/host 本地缓存与 storage-backed 的 L3 缓存。
-
+提供 GPU/host 本地缓存与 storage-backed 的 L3 缓存。
 - Decode offload manager
-  是跟踪 decode 侧 host/storage KV 状态的自然落点。
-
+是跟踪 decode 侧 host/storage KV 状态的自然落点。
 - Disaggregation transport layer
-  是 prefill 与 decode 之间进行 KV 传输的数据面。
-
+是 prefill 与 decode 之间进行 KV 传输的数据面。
 - Model gateway / router
-  是注入 DualPath 元数据和进行路径选择的控制面。
+是注入 DualPath 元数据和进行路径选择的控制面。
 
 ## 5. 整体架构
 
@@ -117,13 +112,11 @@ DualPath 通过新增两条能力来解决这个问题：
 当前控制面支持以下模式：
 
 - `prefill_only`
-  强制走传统路径。
-
+强制走传统路径。
 - `decode_only`
-  优先使用 decode 侧 storage read 路径。
-
+优先使用 decode 侧 storage read 路径。
 - `hybrid_auto`
-  使用当前启发式自动选路逻辑。
+使用当前启发式自动选路逻辑。
 
 ## 6. 控制面改动
 
@@ -182,9 +175,13 @@ disaggregation 层被扩展为不再把 sender/receiver 角色硬编码绑定到
 decode 侧 storage read 作为 MVP 路径，构建在现有 decode offload / HiCache 基础设施之上：
 
 1. Decode 跟踪已经 offload 到 host/storage 的 KV。
-2. Decode 从 HiCache L3 发起 storage read。
-3. 读取结果落到 host-side buffer。
-4. Decode 之后可以把这些 buffer 再反向传给 prefill。
+2. Prefill 先完成常规的 device/host prefix match，并计算本次请求的 `matched_len`。
+3. 对于 `de_read` 请求，prefill 会把 `matched_len`、`last_hash` 和 `prefix_keys` 注册到 bootstrap server。
+4. Decode 拿到这份元数据后，只会对 prefill miss 的 tail 从 HiCache L3 发起 storage read，而不是对整段 prompt 重新读取。
+5. 读取结果落到 host-side buffer。
+6. Decode 之后可以把这些 buffer 再反向传给 prefill。
+
+这样做的直接目的，是避免在请求已经命中 device/host prefix 的情况下，decode 仍然对完整 prompt 多做一次 storage 读取。
 
 当前验证这条路径是否生效的核心指标是：
 
@@ -207,10 +204,11 @@ decode 侧 storage read 作为 MVP 路径，构建在现有 decode offload / HiC
 1. Prefill 先正常分配 output cache 位置。
 2. Prefill 对可复用的 prompt prefix 尝试执行 reverse receive。
 3. 如果成功：
-   - 更新 `prefix_indices`
-   - 减少 `extend_input_len`
-   - 更新 hit 统计
-4. Prefill 只对未命中的 prompt suffix 执行真实计算
+  - 更新 `prefix_indices`
+  - 减少 `extend_input_len`
+  - 更新 hit 统计
+4. 即使请求已经有部分 device/host prefix hit，prefill 也可以继续把 decode 侧 reverse 回来的 miss tail 追加到已有 prefix 之后。
+5. Prefill 只对最终仍未命中的 prompt suffix 执行真实计算
 
 这使得 reverse path 不只是“传输可用”，而是真正带来 prompt 计算缩减。
 
@@ -233,6 +231,37 @@ pressure smoke 脚本通过以下方式判断 DualPath 是否工作：
 
 - 请求必须全部完成
 - `decode_storage_read_hit_tokens` 在测试期间必须增长
+
+### 8.1 `return_cached_tokens_details=true` 返回说明
+
+当请求包含 `return_cached_tokens_details=true` 时，响应中的 `sglext.cached_tokens_details` 会返回更细的 cache 来源拆分：
+
+- `device`: 命中 device cache 的 token 数
+- `host`: 命中 host cache 的 token 数
+- `storage`: 命中 L3 storage 的 token 数
+- `storage_backend`: 当前使用的 storage backend 类型
+- `storage_path`: 本次 storage 命中来自哪条路径，只在 `storage > 0` 时返回
+
+`storage_path` 的语义如下：
+
+- `prefill`: 命中来自 prefill 侧 HiCache storage prefetch
+- `decode`: 命中来自 decode 侧 miss-tail storage read，并经 `decode -> prefill` reverse merge 被 prefill 复用
+
+示例：
+
+```json
+{
+  "sglext": {
+    "cached_tokens_details": {
+      "device": 16,
+      "host": 0,
+      "storage": 8,
+      "storage_backend": "file",
+      "storage_path": "decode"
+    }
+  }
+}
+```
 
 ## 9. 关键代码位置
 
@@ -382,6 +411,10 @@ python scripts/dualpath_pressure_smoke.py
 
 ```bash
 cd /pfs-verdent/libaoguo/sglang
+mkdir -p /pfs-verdent/libaoguo/tmp/dualpath-hicache
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/pfs-verdent/libaoguo/tmp/dualpath-hicache
+export SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE=16
 PYTHONPATH="/pfs-verdent/libaoguo/sglang/python" \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-1.5B-Instruct \
@@ -395,13 +428,19 @@ python3 -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-storage-backend file \
   --hicache-ratio 2 \
-  --dualpath-enable
+  --dualpath-enable \
+  --enable-metrics \
+  --enable-cache-report
 ```
 
 ### 11.2 启动 decode worker
 
 ```bash
 cd /pfs-verdent/libaoguo/sglang
+mkdir -p /pfs-verdent/libaoguo/tmp/dualpath-hicache
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/pfs-verdent/libaoguo/tmp/dualpath-hicache
+export SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE=16
 PYTHONPATH="/pfs-verdent/libaoguo/sglang/python" \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-1.5B-Instruct \
@@ -410,6 +449,7 @@ python3 -m sglang.launch_server \
   --port 31200 \
   --disaggregation-mode decode \
   --disaggregation-bootstrap-port 31500 \
+  --dualpath-decode-bootstrap-port 31501 \
   --base-gpu-id 1 \
   --tp 1 \
   --page-size 16 \
@@ -417,8 +457,12 @@ python3 -m sglang.launch_server \
   --hicache-ratio 2 \
   --disaggregation-decode-enable-offload-kvcache \
   --num-reserved-decode-tokens 128 \
-  --dualpath-enable
+  --dualpath-enable \
+  --enable-metrics \
+  --enable-cache-report
 ```
+
+注意：`decode` 侧不要再额外传 `--enable-hierarchical-cache`。`decode` 模式会在服务端参数处理阶段强制关闭 radix cache 并走 chunk-cache 路径；如果再显式打开 `--enable-hierarchical-cache`，启动时会报 `enable-hierarchical-cache and disable-radix-cache are mutually exclusive`。
 
 ### 11.3 启动 router（稳定 smoke 路径）
 
@@ -427,7 +471,7 @@ cd /pfs-verdent/libaoguo/sglang
 python3 -m sglang_router.launch_router \
   --pd-disaggregation \
   --mini-lb \
-  --prefill http://127.0.0.1:31100 \
+  --prefill http://127.0.0.1:31100 31500 \
   --decode http://127.0.0.1:31200 \
   --host 127.0.0.1 \
   --port 31000 \

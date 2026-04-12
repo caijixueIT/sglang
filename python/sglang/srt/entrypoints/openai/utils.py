@@ -128,6 +128,7 @@ def process_cached_tokens_details_from_ret(
             host=details.get("host", 0),
             storage=details.get("storage", 0),
             storage_backend=details.get("storage_backend"),
+            storage_path=details.get("storage_path"),
         )
     else:
         return CachedTokensDetails(

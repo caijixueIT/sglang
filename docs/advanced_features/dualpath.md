@@ -182,9 +182,13 @@ This allows the system to support:
 Decode-side storage read is implemented as an MVP path on top of the existing decode offload / HiCache infrastructure:
 
 1. Decode tracks offloaded KV in host/storage.
-2. Decode initiates storage reads from HiCache L3.
-3. Read results land in host-side buffers.
-4. Decode may later reverse-transfer those buffers to prefill.
+2. Prefill first performs the normal device/host prefix match and computes `matched_len`.
+3. For `de_read` requests, prefill registers `matched_len`, `last_hash`, and `prefix_keys` in the bootstrap server.
+4. Decode reads that metadata and only issues an L3 storage read for the prefill miss tail, instead of re-reading the full prompt.
+5. Read results land in host-side buffers.
+6. Decode may later reverse-transfer those buffers to prefill.
+
+The point of this change is to avoid wasting storage bandwidth when the request already has a reusable device/host prefix hit.
 
 The main metric used for validation is:
 
@@ -210,7 +214,8 @@ The key merge logic lives in `ScheduleBatch` and works as follows:
    - `prefix_indices` are updated
    - `extend_input_len` is reduced
    - hit statistics are updated
-4. Prefill only computes the miss suffix of the prompt
+4. Even when the request already has a partial device/host prefix hit, prefill can still append the reverse-transferred miss tail after the existing prefix.
+5. Prefill only computes the final miss suffix of the prompt
 
 This makes the reverse path useful beyond mere transport correctness.
 
@@ -233,6 +238,37 @@ The pressure smoke script validates DualPath by checking that:
 
 - requests complete successfully
 - `decode_storage_read_hit_tokens` increases during the test
+
+### 8.1 `return_cached_tokens_details=true` response fields
+
+When a request includes `return_cached_tokens_details=true`, the response field `sglext.cached_tokens_details` exposes a finer-grained cache-source breakdown:
+
+- `device`: tokens served from device cache
+- `host`: tokens served from host cache
+- `storage`: tokens served from L3 storage
+- `storage_backend`: the active storage backend type
+- `storage_path`: which path produced the storage hit; this field is only returned when `storage > 0`
+
+`storage_path` means:
+
+- `prefill`: the storage hit came from prefill-side HiCache storage prefetch
+- `decode`: the storage hit came from decode-side miss-tail storage read and was later reused on prefill through reverse merge
+
+Example:
+
+```json
+{
+  "sglext": {
+    "cached_tokens_details": {
+      "device": 16,
+      "host": 0,
+      "storage": 8,
+      "storage_backend": "file",
+      "storage_path": "decode"
+    }
+  }
+}
+```
 
 ## 9. Main Code Locations
 
@@ -382,6 +418,10 @@ If you want to debug the stack manually instead of using the smoke script, use t
 
 ```bash
 cd /pfs-verdent/libaoguo/sglang
+mkdir -p /pfs-verdent/libaoguo/tmp/dualpath-hicache
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/pfs-verdent/libaoguo/tmp/dualpath-hicache
+export SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE=16
 PYTHONPATH="/pfs-verdent/libaoguo/sglang/python" \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-1.5B-Instruct \
@@ -395,13 +435,19 @@ python3 -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-storage-backend file \
   --hicache-ratio 2 \
-  --dualpath-enable
+  --dualpath-enable \
+  --enable-metrics \
+  --enable-cache-report
 ```
 
 ### 11.2 Decode worker
 
 ```bash
 cd /pfs-verdent/libaoguo/sglang
+mkdir -p /pfs-verdent/libaoguo/tmp/dualpath-hicache
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/pfs-verdent/libaoguo/tmp/dualpath-hicache
+export SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE=16
 PYTHONPATH="/pfs-verdent/libaoguo/sglang/python" \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-1.5B-Instruct \
@@ -410,6 +456,7 @@ python3 -m sglang.launch_server \
   --port 31200 \
   --disaggregation-mode decode \
   --disaggregation-bootstrap-port 31500 \
+  --dualpath-decode-bootstrap-port 31501 \
   --base-gpu-id 1 \
   --tp 1 \
   --page-size 16 \
@@ -417,8 +464,12 @@ python3 -m sglang.launch_server \
   --hicache-ratio 2 \
   --disaggregation-decode-enable-offload-kvcache \
   --num-reserved-decode-tokens 128 \
-  --dualpath-enable
+  --dualpath-enable \
+  --enable-metrics \
+  --enable-cache-report
 ```
+
+Important: do not add `--enable-hierarchical-cache` on the decode side. In `decode` mode the server argument handling already forces chunk-cache mode by setting `disable_radix_cache=true`; adding `--enable-hierarchical-cache` on top of that makes startup fail with `enable-hierarchical-cache and disable-radix-cache are mutually exclusive`.
 
 ### 11.3 Router (stable smoke path)
 
