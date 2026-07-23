@@ -63,6 +63,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.tool_call_metrics import (
     close_open_stream_tools,
+    succeed_stream_tool,
     tool_call_context,
 )
 from sglang.srt.function_call.utils import (
@@ -1999,6 +2000,10 @@ class OpenAIServingChat(OpenAIServingBase):
         Check for any remaining tool call arguments that need to be streamed
         when generation finishes. This ensures tool calls are properly completed
         even if the model generates the final arguments in the last chunk.
+
+        Every tracked tool call is checked (not just the last one): with
+        speculative decoding several short calls can complete inside the
+        final delta, each potentially holding unstreamed arguments.
         """
         # Get the detector - either from FunctionCallParser or directly if json detector
         detector = parser.detector if hasattr(parser, "detector") else parser
@@ -2016,24 +2021,30 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return None
 
-        # Get the last tool call that was being processed
-        tool_index = len(detector.prev_tool_call_arr) - 1
-        if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
-            return None
+        parser_name = getattr(detector, "_tool_metrics_parser", None)
+        sse_chunks = []
+        for tool_index in range(len(detector.prev_tool_call_arr)):
+            if tool_index >= len(detector.streamed_args_for_tool):
+                break
 
-        # Get expected vs actual arguments
-        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
-        actual_call = detector.streamed_args_for_tool[tool_index]
+            # Get expected vs actual arguments; skip placeholder entries
+            # that never parsed an arguments object.
+            expected_args = detector.prev_tool_call_arr[tool_index].get("arguments")
+            if expected_args is None:
+                continue
+            expected_call = json.dumps(expected_args, ensure_ascii=False)
+            actual_call = detector.streamed_args_for_tool[tool_index]
 
-        # Check if there are remaining arguments to send
-        remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
-            else ""
-        )
+            # Check if there are remaining arguments to send
+            remaining_call = (
+                expected_call.replace(actual_call, "", 1)
+                if actual_call in expected_call
+                else ""
+            )
 
-        if remaining_call:
+            if not remaining_call:
+                continue
+
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
                 id=None,  # No ID for argument deltas
@@ -2057,9 +2068,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+            sse_chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+            detector.streamed_args_for_tool[tool_index] = expected_call
 
-        return None
+            # The call is now fully delivered; close its metric entry as a
+            # success so _close_open_tool_call_metrics does not count it as
+            # incomplete_stream. No-op if the tool was already closed.
+            if parser_name:
+                succeed_stream_tool(
+                    detector, parser_name, tool_index, reason="flushed_at_finish"
+                )
+
+        return "".join(sse_chunks) or None
 
     def _close_open_tool_call_metrics(
         self,

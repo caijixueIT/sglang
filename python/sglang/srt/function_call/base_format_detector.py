@@ -316,30 +316,20 @@ class BaseFormatDetector(ABC):
                             self.current_tool_id,
                             "name_sent",
                         )
+                    # If the tool call JSON is already complete in this chunk,
+                    # register it in prev_tool_call_arr so the finish-time
+                    # flush (_check_for_unstreamed_tool_args) can emit the
+                    # full arguments even when no further delta arrives
+                    # (e.g. speculative decoding completing a short call in
+                    # the final chunk). Argument streaming itself still goes
+                    # through Case 2 on the next parse call, keeping the
+                    # chunk timing identical to the classic path.
                     if is_current_complete and "arguments" in current_tool_call:
-                        completing_tool_id = self.current_tool_id
-                        cur_args_json = json.dumps(
-                            current_tool_call["arguments"], ensure_ascii=False
-                        )
-                        res.calls.append(
-                            ToolCallItem(
-                                tool_index=completing_tool_id,
-                                parameters=cur_args_json,
-                            )
-                        )
-                        self.streamed_args_for_tool[completing_tool_id] += cur_args_json
-                        while len(self.prev_tool_call_arr) <= completing_tool_id:
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
                             self.prev_tool_call_arr.append({})
-                        self.prev_tool_call_arr[completing_tool_id] = current_tool_call
-                        self._buffer = current_text[start_idx + end_idx :]
-                        if hasattr(self, "_tool_metrics_parser"):
-                            succeed_stream_tool(
-                                self,
-                                self._tool_metrics_parser,
-                                completing_tool_id,
-                            )
-                        self.current_tool_name_sent = False
-                        self.current_tool_id += 1
+                        self.prev_tool_call_arr[self.current_tool_id] = (
+                            current_tool_call
+                        )
                 else:
                     if hasattr(self, "_tool_metrics_parser") and is_current_complete:
                         tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
