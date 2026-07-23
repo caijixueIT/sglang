@@ -3,6 +3,7 @@ from typing import List
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
+from sglang.srt.function_call.tool_call_metrics import reset_stream_tool_metrics
 
 
 class JsonArrayParser(BaseFormatDetector):
@@ -19,6 +20,8 @@ class JsonArrayParser(BaseFormatDetector):
         self.bot_token = "["
         self.eot_token = "]"
         self.tool_call_separator = ","
+        self._tool_metrics_parser = "json_fallback"
+        reset_stream_tool_metrics(self)
 
     def has_tool_call(self, text: str) -> bool:
         """

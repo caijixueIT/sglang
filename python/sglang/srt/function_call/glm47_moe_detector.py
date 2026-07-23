@@ -17,6 +17,15 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.tool_call_metrics import (
+    begin_stream_tool,
+    close_open_stream_tools,
+    fail_stream_tool,
+    forget_stream_tool,
+    observe_undefined_function,
+    reset_stream_tool_metrics,
+    succeed_stream_tool,
+)
 from sglang.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
@@ -185,10 +194,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
-        self._tool_call_completed = False  # Track if tool call has been completed
-        self._sent_empty_object = (
-            False  # Track if empty object has been sent for no-arg functions
-        )
+        self._tool_call_completed = False
+        self._sent_empty_object = False
+        self._tool_metrics_parser = "glm47"
+        reset_stream_tool_metrics(self)
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -501,7 +510,35 @@ class Glm47MoeDetector(BaseFormatDetector):
             return None
 
         if not func_name:
-            logger.warning("Empty function name detected, skipping tool call")
+            tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+            if fail_stream_tool(self, self._tool_metrics_parser, tool_id, "empty_function_name"):
+                logger.warning(
+                    "tool_call_parse_error | parser=%s reason=empty_function_name "
+                    "tool_id=%s has_arg_key=%s is_tool_end=%r",
+                    self._tool_metrics_parser, tool_id, has_arg_key, is_tool_end,
+                )
+            return None
+
+        # Check if function name is in the defined tools
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices([])
+        if func_name not in self._tool_indices:
+            tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+            if fail_stream_tool(
+                self,
+                self._tool_metrics_parser,
+                tool_id,
+                "undefined_function",
+            ):
+                available = list(self._tool_indices.keys())
+                logger.warning(
+                    "tool_call_parse_error | parser=%s reason=undefined_function "
+                    "tool_id=%s func_name=%r available_tools=%s",
+                    self._tool_metrics_parser, tool_id, func_name, available,
+                )
+                observe_undefined_function(
+                    self._tool_metrics_parser, func_name, "undefined_function"
+                )
             return None
 
         # Send tool name
@@ -514,6 +551,8 @@ class Glm47MoeDetector(BaseFormatDetector):
             "name": func_name,
             "arguments": {},
         }
+
+        begin_stream_tool(self, self._tool_metrics_parser, self.current_tool_id, "name_sent")
 
         return ToolCallItem(
             tool_index=self.current_tool_id,
@@ -629,11 +668,13 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Reset state for next tool call
         self._tool_call_completed = True
+        completed_id = self.current_tool_id
         self.current_tool_id += 1
         self._last_arguments = ""
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._reset_streaming_state()
+        succeed_stream_tool(self, self._tool_metrics_parser, completed_id)
 
         return calls
 
@@ -736,6 +777,29 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
             if tool_name_item:
                 calls.append(tool_name_item)
+            elif (
+                not self.current_tool_name_sent
+                and is_tool_end == self.eot_token
+                and (not func_name or func_name not in self._tool_indices)
+            ):
+                invalid_tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+                self._buffer = current_text[partial_match.end() :]
+                if (
+                    invalid_tool_id < len(self.prev_tool_call_arr)
+                    and not self.prev_tool_call_arr[invalid_tool_id].get("name")
+                ):
+                    self.prev_tool_call_arr.pop(invalid_tool_id)
+                if (
+                    invalid_tool_id < len(self.streamed_args_for_tool)
+                    and not self.streamed_args_for_tool[invalid_tool_id]
+                ):
+                    self.streamed_args_for_tool.pop(invalid_tool_id)
+                self.current_tool_id = invalid_tool_id
+                self._last_arguments = ""
+                self._streamed_raw_length = 0
+                self._reset_streaming_state()
+                forget_stream_tool(self, invalid_tool_id)
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
 
             # Process streaming arguments if tool name has been sent
             if self.current_tool_name_sent:
@@ -758,7 +822,19 @@ class Glm47MoeDetector(BaseFormatDetector):
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+            func_name_log = (
+                self.prev_tool_call_arr[tool_id].get("name", "unknown")
+                if tool_id < len(self.prev_tool_call_arr)
+                else "unknown"
+            )
+            logger.error(
+                "tool_call_parse_error | parser=%s reason=exception "
+                "tool_id=%s func_name=%s error=%s buffer=%.300r",
+                self._tool_metrics_parser, tool_id, func_name_log, e, current_text,
+                exc_info=True,
+            )
+            close_open_stream_tools(self, self._tool_metrics_parser, "exception")
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)

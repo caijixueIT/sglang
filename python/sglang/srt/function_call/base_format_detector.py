@@ -20,6 +20,14 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.tool_call_metrics import (
+    begin_stream_tool,
+    close_open_stream_tools,
+    fail_stream_tool,
+    forget_stream_tool,
+    observe_undefined_function,
+    succeed_stream_tool,
+)
 from sglang.srt.function_call.utils import (
     _find_common_prefix,
     _is_complete_json,
@@ -217,12 +225,33 @@ class BaseFormatDetector(ABC):
 
                 # Validate tool name if present
                 if "name" in obj and obj["name"] not in self._tool_indices:
+                    if hasattr(self, "_tool_metrics_parser"):
+                        tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+                        available = list(self._tool_indices.keys())
+                        logger.warning(
+                            "tool_call_parse_error | parser=%s reason=undefined_function "
+                            "tool_id=%s func_name=%r available_tools=%s",
+                            self._tool_metrics_parser, tool_id, obj["name"], available,
+                        )
+                        if fail_stream_tool(
+                            self,
+                            self._tool_metrics_parser,
+                            tool_id,
+                            "undefined_function",
+                        ):
+                            observe_undefined_function(
+                                self._tool_metrics_parser,
+                                obj["name"],
+                                "undefined_function",
+                            )
                     # Invalid tool name - reset state
                     self._buffer = ""
                     self.current_tool_id = -1
                     self.current_tool_name_sent = False
                     if self.streamed_args_for_tool:
                         self.streamed_args_for_tool.pop()
+                    if hasattr(self, "_tool_metrics_parser"):
+                        forget_stream_tool(self, tool_id)
                     return StreamingParseResult()
 
                 # Handle parameters/arguments consistency
@@ -239,6 +268,19 @@ class BaseFormatDetector(ABC):
                 return StreamingParseResult()
 
             if not current_tool_call:
+                if hasattr(self, "_tool_metrics_parser") and is_current_complete:
+                    tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+                    if fail_stream_tool(
+                        self,
+                        self._tool_metrics_parser,
+                        tool_id,
+                        "empty_tool_payload",
+                    ):
+                        logger.warning(
+                            "tool_call_parse_error | parser=%s reason=empty_tool_payload "
+                            "tool_id=%s buffer=%.200r",
+                            self._tool_metrics_parser, tool_id, current_text,
+                        )
                 return StreamingParseResult()
 
             # Case 1: Handle tool name streaming
@@ -267,7 +309,51 @@ class BaseFormatDetector(ABC):
                         ],
                     )
                     self.current_tool_name_sent = True
+                    if hasattr(self, "_tool_metrics_parser"):
+                        begin_stream_tool(
+                            self,
+                            self._tool_metrics_parser,
+                            self.current_tool_id,
+                            "name_sent",
+                        )
+                    if is_current_complete and "arguments" in current_tool_call:
+                        completing_tool_id = self.current_tool_id
+                        cur_args_json = json.dumps(
+                            current_tool_call["arguments"], ensure_ascii=False
+                        )
+                        res.calls.append(
+                            ToolCallItem(
+                                tool_index=completing_tool_id,
+                                parameters=cur_args_json,
+                            )
+                        )
+                        self.streamed_args_for_tool[completing_tool_id] += cur_args_json
+                        while len(self.prev_tool_call_arr) <= completing_tool_id:
+                            self.prev_tool_call_arr.append({})
+                        self.prev_tool_call_arr[completing_tool_id] = current_tool_call
+                        self._buffer = current_text[start_idx + end_idx :]
+                        if hasattr(self, "_tool_metrics_parser"):
+                            succeed_stream_tool(
+                                self,
+                                self._tool_metrics_parser,
+                                completing_tool_id,
+                            )
+                        self.current_tool_name_sent = False
+                        self.current_tool_id += 1
                 else:
+                    if hasattr(self, "_tool_metrics_parser") and is_current_complete:
+                        tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+                        logger.warning(
+                            "tool_call_parse_error | parser=%s reason=empty_function_name "
+                            "tool_id=%s partial_obj=%r",
+                            self._tool_metrics_parser, tool_id, current_tool_call,
+                        )
+                        fail_stream_tool(
+                            self,
+                            self._tool_metrics_parser,
+                            tool_id,
+                            "empty_function_name",
+                        )
                     res = StreamingParseResult()
 
             # Case 2: Handle streaming arguments
@@ -316,6 +402,12 @@ class BaseFormatDetector(ABC):
 
                     # Advance to next tool if complete
                     if is_current_complete:
+                        if hasattr(self, "_tool_metrics_parser"):
+                            succeed_stream_tool(
+                                self,
+                                self._tool_metrics_parser,
+                                completing_tool_id,
+                            )
                         self.current_tool_name_sent = False
                         self.current_tool_id += 1
 
@@ -337,10 +429,42 @@ class BaseFormatDetector(ABC):
                         )
                         self.streamed_args_for_tool[tool_index_to_use] += argument_diff
 
+                elif hasattr(self, "_tool_metrics_parser") and is_current_complete:
+                    tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
+                    if fail_stream_tool(
+                        self,
+                        self._tool_metrics_parser,
+                        tool_id,
+                        "missing_parameters",
+                    ):
+                        func_name = (
+                            self.prev_tool_call_arr[tool_id].get("name", "unknown")
+                            if tool_id < len(self.prev_tool_call_arr)
+                            else "unknown"
+                        )
+                        logger.warning(
+                            "tool_call_parse_error | parser=%s reason=missing_parameters "
+                            "tool_id=%s func_name=%s partial_obj=%r",
+                            self._tool_metrics_parser, tool_id, func_name, current_tool_call,
+                        )
+
             return res
 
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
+            logger.error(
+                "tool_call_parse_error | parser=%s reason=exception "
+                "tool_id=%s func_name=%s error=%s buffer=%.300r",
+                getattr(self, "_tool_metrics_parser", "unknown"),
+                self.current_tool_id,
+                (self.prev_tool_call_arr[self.current_tool_id].get("name", "unknown")
+                 if self.current_tool_id >= 0 and self.current_tool_id < len(self.prev_tool_call_arr)
+                 else "unknown"),
+                e,
+                current_text,
+                exc_info=True,
+            )
+            if hasattr(self, "_tool_metrics_parser"):
+                close_open_stream_tools(self, self._tool_metrics_parser, "exception")
             return StreamingParseResult()
 
     @abstractmethod

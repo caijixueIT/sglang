@@ -61,6 +61,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.tool_call_metrics import (
+    close_open_stream_tools,
+    tool_call_context,
+)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -420,9 +424,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
-                remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
-                )
+                with tool_call_context(request.tool_choice):
+                    remaining_chunk = self._check_for_unstreamed_tool_args(
+                        parser, content, request, index
+                    )
+                    self._close_open_tool_call_metrics(parser)
                 if remaining_chunk:
                     yield remaining_chunk
 
@@ -1894,11 +1900,12 @@ class OpenAIServingChat(OpenAIServingBase):
         parser = parser_dict[index]
 
         # Handle both FunctionCallParser and JsonArrayParser
-        if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, request.tools)
-            normal_text, calls = result.normal_text, result.calls
-        else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
+        with tool_call_context(request.tool_choice):
+            if isinstance(parser, JsonArrayParser):
+                result = parser.parse_streaming_increment(delta, request.tools)
+                normal_text, calls = result.normal_text, result.calls
+            else:
+                normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
         if normal_text:
@@ -2053,3 +2060,21 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
+
+    def _close_open_tool_call_metrics(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        reason: str = "incomplete_stream",
+    ) -> None:
+        detector = parser.detector if hasattr(parser, "detector") else parser
+        parser_name = getattr(detector, "_tool_metrics_parser", None)
+        if parser_name:
+            reason_getter = getattr(detector, "incomplete_stream_reason", None)
+            if reason == "incomplete_stream" and callable(reason_getter):
+                reason = reason_getter()
+            result = (
+                "success"
+                if reason == "missing_tool_call_end_with_complete_json"
+                else "failure"
+            )
+            close_open_stream_tools(detector, parser_name, reason, result=result)
