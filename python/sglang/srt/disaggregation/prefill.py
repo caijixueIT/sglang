@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
+    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -274,6 +275,9 @@ class PrefillBootstrapQueue:
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
+        # Keep the prefix length around: per-token state payloads (DSA indexer
+        # KV) built in send_kv_chunk's last chunk also skip the prefix pages.
+        req.disagg_decode_prefix_len = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
@@ -1042,8 +1046,17 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dsa_payload():
+                # Per-token state rows (DSA indexer KV / MiniMax index-k) are
+                # prefix-reusable: the decode side already holds the rows that
+                # its radix cache matched, exactly like the main KV. Skip those
+                # prefix pages so state transfer cost scales with the delta.
+                # Must mirror decode's `_dsa_payload` truncation so src/dst
+                # page lists stay positionally aligned in `maybe_send_extra`.
+                state_start = page_align_floor(
+                    min(req.disagg_decode_prefix_len, seq_len), page_size
+                )
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.req_pool_idx, state_start:seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 

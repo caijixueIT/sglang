@@ -1031,11 +1031,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
+                # Per-token state rows (DSA indexer KV / MiniMax index-k):
+                # the radix-hit prefix rows are already valid locally, so only
+                # receive the delta. Mirrors prefill's `_dsa_payload` so the
+                # src/dst page lists stay positionally aligned.
+                state_start = page_align_floor(
+                    min(total_prefix_len, seq_len), device_page_size
+                )
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, state_start:seq_len
+                ]
                 return kv_to_page_indices(
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
