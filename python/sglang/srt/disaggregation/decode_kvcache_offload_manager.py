@@ -55,29 +55,6 @@ class DecodeKVCacheOffloadManager:
             self.offload_stride = max(
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-            )
-        elif isinstance(kv_cache, MLATokenToKVPool):
-            self.decode_host_mem_pool = MLATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-            )
-        else:
-            raise ValueError("Unsupported KV cache type for decode offload")
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-
         hicache_storage_backend_extra_config = {}
         if server_args.hicache_storage_backend_extra_config:
             try:
@@ -88,6 +65,38 @@ class DecodeKVCacheOffloadManager:
                 raise ValueError(
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
+        allocator_type = (
+            "mooncake"
+            if server_args.hicache_storage_backend == "mooncake"
+            and hicache_storage_backend_extra_config.get(
+                "standalone_storage", False
+            )
+            else "default"
+        )
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kv_cache, MHATokenToKVPool):
+            self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
+            )
+        elif isinstance(kv_cache, MLATokenToKVPool):
+            self.decode_host_mem_pool = MLATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
+            )
+        else:
+            raise ValueError("Unsupported KV cache type for decode offload")
+
+        self.tp_group = tp_group
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

@@ -24,6 +24,9 @@ class HostTensorAllocator:
         self.dims = dims
         return alloc_mmap(dims, dtype)
 
+    def cuda_registration_nbytes(self, buffer: torch.Tensor) -> int:
+        return buffer.numel() * buffer.element_size()
+
 
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
@@ -58,9 +61,10 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def _cuda_host_register(buffer: torch.Tensor) -> None:
+def _cuda_host_register(buffer: torch.Tensor, n_bytes: int | None = None) -> None:
     cudart = torch.cuda.cudart()
-    n_bytes = buffer.numel() * buffer.element_size()
+    if n_bytes is None:
+        n_bytes = buffer.numel() * buffer.element_size()
     rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
     if int(rc) != 0:
         raise RuntimeError(
@@ -97,7 +101,7 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer)
+        _cuda_host_register(buffer, allocator.cuda_registration_nbytes(buffer))
     return buffer
 
 
