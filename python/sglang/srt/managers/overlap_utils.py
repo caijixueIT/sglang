@@ -219,13 +219,27 @@ class FutureMap:
             )
 
         self.dsa_topk_indices_buf = None
-        if payload.dsa_topk_indices is not None:
-            seed0 = payload.dsa_topk_indices[0]
-            self.dsa_topk_indices_buf = torch.empty(
-                (self.req_pool_size, *seed0.shape),
-                dtype=payload.dsa_topk_indices.dtype,
-                device=self.device,
-            )
+        self._ensure_dsa_topk_buf(payload)
+
+    def _ensure_dsa_topk_buf(self, payload: RelayPayload) -> None:
+        # Unlike the other spec extras, dsa_topk_indices is intermittently
+        # None on a per-iteration basis (e.g. the first verify of a request
+        # transferred from prefill in PD disaggregation carries no seed). So
+        # the buf must be creatable on ANY seeded stash, not only the first
+        # one, or later seeds are silently dropped and _resolve_spec_extras
+        # leaves a stale, wrongly-shaped tensor on draft_input (crashes the
+        # draft CUDA-graph copy when the batch size shrinks).
+        if self.dsa_topk_indices_buf is not None or payload.dsa_topk_indices is None:
+            return
+        seed0 = payload.dsa_topk_indices[0]
+        # zeros, not empty: rows for requests that never stashed a seed must
+        # gather as the zero seed (the draft runner's documented fallback for
+        # a missing seed), never as uninitialized indices.
+        self.dsa_topk_indices_buf = torch.zeros(
+            (self.req_pool_size, *seed0.shape),
+            dtype=payload.dsa_topk_indices.dtype,
+            device=self.device,
+        )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
@@ -268,6 +282,12 @@ class FutureMap:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if self.dsa_topk_indices_buf is not None:
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
+        elif draft_input.dsa_topk_indices is not None:
+            # Buf never materialized (no seeded stash yet) but the draft input
+            # still carries a directly-assigned seed from a previous iteration.
+            # Its row count can be out of sync with the (filtered) batch, so
+            # drop it and let the runner take the zero-seed fallback.
+            draft_input.dsa_topk_indices = None
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -351,10 +371,17 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
-        if (
-            self.dsa_topk_indices_buf is not None
-            and payload.dsa_topk_indices is not None
-        ):
-            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
-                self.dsa_topk_indices_buf.dtype
-            )
+        # Late-create the buf if the first-ever stash carried no seed (see
+        # _ensure_dsa_topk_buf); otherwise seeded stashes would be dropped.
+        self._ensure_dsa_topk_buf(payload)
+        if self.dsa_topk_indices_buf is not None:
+            if payload.dsa_topk_indices is not None:
+                self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                    self.dsa_topk_indices_buf.dtype
+                )
+            else:
+                # No seed this iteration (e.g. verify right after a PD
+                # transfer): reset the rows so the next resolve gathers the
+                # zero-seed fallback instead of a stale seed from a previous
+                # request that used the same req_pool slots.
+                self.dsa_topk_indices_buf[indices] = 0
