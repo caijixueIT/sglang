@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -483,6 +484,24 @@ class Glm47MoeDetector(BaseFormatDetector):
             (func_name, func_args_raw, is_tool_end)
         """
         func_name = match.group(1).strip()
+        # Some GLM decoding artifacts re-emit the opening "<tool_call>" marker
+        # in the middle of (or repeated at the start of) the function-name
+        # capture, e.g. "<tool_call><tool_call>Read" or
+        # "read_view_context<tool_call>file_read". Left untouched, the whole
+        # polluted string fails the tool lookup and the call is silently
+        # dropped as an undefined function even though a valid, registered
+        # tool name is actually present. Recover it by checking each
+        # "<tool_call>"-delimited fragment (preferring the last one, which is
+        # closest to the real call) against the known tool names.
+        if self.bot_token in func_name and hasattr(self, "_tool_indices"):
+            fragments = [f.strip() for f in func_name.split(self.bot_token)]
+            for fragment in reversed(fragments):
+                if fragment and fragment in self._tool_indices:
+                    func_name = fragment
+                    break
+            else:
+                while func_name.startswith(self.bot_token):
+                    func_name = func_name[len(self.bot_token):].lstrip()
         func_args_raw = match.group(2).strip() if match.group(2) else ""
         is_tool_end = match.group(3) or ""
         return func_name, func_args_raw, is_tool_end
@@ -524,22 +543,33 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._tool_indices = self._get_tool_indices([])
         if func_name not in self._tool_indices:
             tool_id = self.current_tool_id if self.current_tool_id >= 0 else 0
-            if fail_stream_tool(
-                self,
-                self._tool_metrics_parser,
-                tool_id,
-                "undefined_function",
-            ):
-                available = list(self._tool_indices.keys())
-                logger.warning(
-                    "tool_call_parse_error | parser=%s reason=undefined_function "
-                    "tool_id=%s func_name=%r available_tools=%s",
-                    self._tool_metrics_parser, tool_id, func_name, available,
-                )
-                observe_undefined_function(
-                    self._tool_metrics_parser, func_name, "undefined_function"
-                )
-            return None
+            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                if fail_stream_tool(
+                    self,
+                    self._tool_metrics_parser,
+                    tool_id,
+                    "undefined_function",
+                ):
+                    available = list(self._tool_indices.keys())
+                    logger.warning(
+                        "tool_call_parse_error | parser=%s reason=undefined_function "
+                        "tool_id=%s func_name=%r available_tools=%s",
+                        self._tool_metrics_parser, tool_id, func_name, available,
+                    )
+                    observe_undefined_function(
+                        self._tool_metrics_parser, func_name, "undefined_function"
+                    )
+                return None
+            # SGLANG_FORWARD_UNKNOWN_TOOLS: pass the call through unchanged so
+            # the client can decide how to handle it (consistent with the
+            # other detectors' handling of undefined functions).
+            logger.warning(
+                "Forwarding call to undefined function: %r (parser=%s)",
+                func_name, self._tool_metrics_parser,
+            )
+            observe_undefined_function(
+                self._tool_metrics_parser, func_name, "undefined_function_forwarded"
+            )
 
         # Send tool name
         self.current_tool_name_sent = True

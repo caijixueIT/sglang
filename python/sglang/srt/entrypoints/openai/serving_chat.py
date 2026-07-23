@@ -1262,6 +1262,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Cover system-error aborts, client disconnects/cancellations,
+            # and any other early-exit path that skips the graceful
+            # finish_reason-driven cleanup above, so tool-call metrics
+            # always reach a terminal state.
+            self._close_open_tool_call_metrics_for_all(parser_dict)
 
         yield "data: [DONE]\n\n"
 
@@ -2098,3 +2104,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 else "failure"
             )
             close_open_stream_tools(detector, parser_name, reason, result=result)
+
+    def _close_open_tool_call_metrics_for_all(
+        self,
+        parser_dict: Dict[int, Union[FunctionCallParser, JsonArrayParser]],
+        reason: str = "stream_aborted",
+    ) -> None:
+        """Best-effort cleanup for any tool-call parsers still open when the
+        streaming response exits abnormally (system-error abort, client
+        disconnect/cancellation, or an unhandled exception). Without this,
+        the "triggered" tool-call metric can never be matched by a terminal
+        "success"/"failure" outcome for that stream, leaking the counters
+        permanently out of balance.
+        """
+        for parser in list(parser_dict.values()):
+            try:
+                self._close_open_tool_call_metrics(parser, reason=reason)
+            except Exception:
+                logger.debug(
+                    "Failed to close tool-call metrics on stream exit",
+                    exc_info=True,
+                )

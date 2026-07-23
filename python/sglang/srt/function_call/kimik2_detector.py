@@ -474,6 +474,10 @@ class KimiK2Detector(BaseFormatDetector):
             file_alias = "file_" + name[: -len("_file")]
             if file_alias in tool_indices:
                 return file_alias, "file_prefix_alias"
+        if name.startswith("file_"):
+            file_alias = name[len("file_") :] + "_file"
+            if file_alias in tool_indices:
+                return file_alias, "file_suffix_alias"
         return None
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
@@ -502,9 +506,12 @@ class KimiK2Detector(BaseFormatDetector):
             )
             return None
 
-        # Pick the tool whose properties best match the argument keys.
+        # Pick the tool whose properties best match the argument keys. Reject
+        # the inference when two tools tie for the best score: guessing between
+        # them would silently route arguments to the wrong tool.
         best_name = None
         best_score = None
+        ambiguous = False
         for tool in tools:
             params = tool.function.parameters or {}
             props = set(params.get("properties", {}).keys())
@@ -518,7 +525,15 @@ class KimiK2Detector(BaseFormatDetector):
             if best_score is None or score > best_score:
                 best_score = score
                 best_name = tool.function.name
+                ambiguous = False
+            elif score == best_score:
+                ambiguous = True
 
+        if ambiguous:
+            logger.debug(
+                "Ambiguous schema match for bare-counter tool id; refusing to infer"
+            )
+            return None
         return best_name
 
     def has_tool_call(self, text: str) -> bool:
