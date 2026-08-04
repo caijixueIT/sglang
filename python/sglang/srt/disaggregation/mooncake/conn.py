@@ -238,6 +238,19 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            # Gathered sliced-send path for head-sharded (draft) entries:
+            # tensor handles keyed by data_ptr (set via
+            # set_draft_kv_buffer_tensors) + a lazily allocated, engine
+            # registered GPU scratch. Packs each decode rank's head slice
+            # contiguously so the RDMA descriptor count drops from one per
+            # token to one per contiguous dst page run.
+            self._sliced_gather_buffers: dict = {}
+            self._sliced_gather_scratch = None
+            # Retired scratches stay referenced: their RDMA registrations
+            # remain with the engine, so the memory must not return to the
+            # allocator.
+            self._sliced_gather_retired: list = []
+            self._sliced_gather_lock = threading.Lock()
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -327,6 +340,56 @@ class MooncakeKVManager(CommonKVManager):
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
+
+    def set_draft_kv_buffer_tensors(self, buffers: list):
+        """Register tensor handles (keyed by data_ptr) for head-sharded
+        entries -- e.g. the GQA speculative-draft pool -- enabling the
+        gathered sliced-send path in ``_send_kvcache_generic``. Buffers must
+        be NHD token-major: [pool_tokens, head_num, head_dim]."""
+        self._sliced_gather_buffers = {t.data_ptr(): t for t in buffers}
+
+    def _get_sliced_gather_scratch(self, required_bytes: int):
+        """Lazily allocate (and grow) the engine-registered gather scratch.
+
+        Returns a StagingBuffer or None when allocation/registration fails
+        (callers fall back to the per-token sliced path).
+        """
+        scratch = self._sliced_gather_scratch
+        if scratch is not None and scratch.fits(required_bytes):
+            return scratch
+        try:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                _get_custom_mem_pool,
+            )
+            from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+
+            gpu_id = self.kv_args.gpu_id
+            device = f"cuda:{gpu_id}"
+            custom_mem_pool, _ = _get_custom_mem_pool(device)
+            # Headroom so chunk-size jitter does not trigger regrow cycles.
+            size_bytes = max(required_bytes, 32 * 1024 * 1024)
+            if scratch is not None:
+                logger.info(
+                    "Growing sliced-gather scratch: "
+                    f"{scratch.get_size()} -> {size_bytes} bytes "
+                    "(retiring the old buffer; its registration stays alive)"
+                )
+                # Keep the old scratch referenced forever: its memory is
+                # registered with the RDMA engine and must not return to
+                # the allocator.
+                self._sliced_gather_retired.append(scratch)
+            scratch = StagingBuffer(
+                size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
+            )
+            self.engine.batch_register([scratch.get_ptr()], [scratch.get_size()])
+            self._sliced_gather_scratch = scratch
+            return scratch
+        except Exception as e:
+            logger.warning(
+                f"Sliced-gather scratch unavailable, falling back to per-token "
+                f"sliced sends: {e}"
+            )
+            return None
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -618,6 +681,192 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _send_sliced_entries_gathered(
+        self,
+        mooncake_session_id: str,
+        sliced_layers_params: List[Tuple[int, int, int, int]],
+        prefill_data_indices: npt.NDArray[np.int32],
+        prefill_kv_blocks: List[npt.NDArray[np.int64]],
+        dst_kv_blocks: List[npt.NDArray[np.int64]],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+    ) -> Optional[int]:
+        """Head-sliced entries via GPU gather + run-length RDMA.
+
+        The per-token sliced path posts one descriptor per token per entry
+        (the head slice is strided on the prefill side), which for a 16K-token
+        chunk of a 5-layer GQA draft is ~160K descriptors of 64B. Here we
+        instead gather each entry's head slice for all tokens into a
+        contiguous, engine-registered scratch (one kernel per entry), then
+        write straight into the decode pool's final pages: the decode side
+        packs its rows back-to-back, so one descriptor per contiguous dst
+        page run suffices. No decode-side changes and no extra copy there.
+
+        Returns None to request the per-token fallback (no tensor handles,
+        non-gatherable geometry, or scratch unavailable); otherwise a 0/-1
+        transfer status.
+        """
+        buffers = getattr(self, "_sliced_gather_buffers", None)
+        if not buffers:
+            return None
+
+        import torch
+
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            gather_kv_head_slices,
+        )
+
+        # Bit-preserving integer views: torch.gather support for exotic KV
+        # dtypes (fp8) varies by version; same-width integer copies do not.
+        int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+
+        page_size = self.kv_args.page_size
+        num_pages = len(prefill_data_indices)
+        num_tokens = num_pages * page_size
+        if num_tokens == 0:
+            return 0
+
+        # Resolve tensor handles and head-slice params; any mismatch defers
+        # to the per-token fallback rather than guessing at the layout.
+        entries = []
+        scratch_offset = 0
+        for src_ptr, dst_ptr, src_item_len, dst_item_len in sliced_layers_params:
+            t = buffers.get(src_ptr)
+            if t is None or t.dim() != 3 or t.element_size() not in int_dtype_map:
+                return None
+            head_dim = t.shape[-1]
+            dtype_size = t.element_size()
+            bytes_per_head = head_dim * dtype_size
+            src_bytes_per_token = src_item_len // page_size
+            dst_bytes_per_token = dst_item_len // page_size
+            if (
+                t.shape[1] * bytes_per_head != src_bytes_per_token
+                or dst_bytes_per_token % bytes_per_head != 0
+            ):
+                return None
+            num_heads = dst_bytes_per_token // bytes_per_head
+            # Same head-offset math as the per-token sliced path.
+            tp_ratio = max(dst_attn_tp_size // max(self.attn_tp_size, 1), 1)
+            byte_ratio = src_bytes_per_token // dst_bytes_per_token
+            replication = max(1, tp_ratio // max(byte_ratio, 1))
+            local_dst_rank = (dst_tp_rank % dst_attn_tp_size) % tp_ratio
+            src_head_slice_offset = (
+                local_dst_rank // replication
+            ) * dst_bytes_per_token
+            if (
+                src_head_slice_offset % bytes_per_head != 0
+                or src_head_slice_offset + dst_bytes_per_token > src_bytes_per_token
+            ):
+                return None
+            head_start = src_head_slice_offset // bytes_per_head
+            entries.append(
+                (
+                    t,
+                    dst_ptr,
+                    dst_item_len,
+                    dst_bytes_per_token,
+                    head_start,
+                    num_heads,
+                    scratch_offset,
+                )
+            )
+            scratch_offset += num_tokens * dst_bytes_per_token
+
+        # The scratch is shared across transfer threads; acquisition, gather
+        # and transfer all stay under the lock: concurrent growers would
+        # otherwise double-allocate, and the synchronous transfer must finish
+        # before the next gather may overwrite the buffer.
+        with self._sliced_gather_lock:
+            scratch = self._get_sliced_gather_scratch(scratch_offset)
+            if scratch is None:
+                return None
+
+            import contextlib
+
+            # Device follows the registered buffers (CPU in unit tests).
+            device = entries[0][0].device
+            use_cuda = device.type == "cuda"
+            if use_cuda:
+                torch.cuda.set_device(device)
+            page_idx = torch.from_numpy(prefill_data_indices.astype(np.int64)).to(
+                device, non_blocking=True
+            )
+            if page_size == 1:
+                token_indices = page_idx
+            else:
+                offsets = torch.arange(page_size, device=device)
+                token_indices = (
+                    page_idx.unsqueeze(1) * page_size + offsets
+                ).reshape(-1)
+
+            stream_ctx = contextlib.nullcontext()
+            if use_cuda:
+                if not hasattr(scratch, "_gather_stream"):
+                    scratch._gather_stream = torch.cuda.Stream(device=device)
+                scratch._gather_stream.wait_stream(
+                    torch.cuda.default_stream(device)
+                )
+                stream_ctx = torch.cuda.stream(scratch._gather_stream)
+
+            gather_idx_cache = {}
+            staging_view = scratch.buffer
+            with stream_ctx:
+                for (
+                    t,
+                    _dst_ptr,
+                    _dst_item_len,
+                    dst_bytes_per_token,
+                    head_start,
+                    num_heads,
+                    base,
+                ) in entries:
+                    head_dim = t.shape[-1]
+                    int_dtype = int_dtype_map.get(t.element_size())
+                    if int_dtype is None:
+                        return None
+                    src_int = t.view(int_dtype)
+                    key = (num_heads, head_dim)
+                    gather_idx = gather_idx_cache.get(key)
+                    if gather_idx is None:
+                        gather_idx = token_indices.view(-1, 1, 1).expand(
+                            num_tokens, num_heads, head_dim
+                        )
+                        gather_idx_cache[key] = gather_idx
+                    dst_view = (
+                        staging_view[base : base + num_tokens * dst_bytes_per_token]
+                        .view(int_dtype)
+                        .reshape(num_tokens, num_heads, head_dim)
+                    )
+                    gather_kv_head_slices(
+                        src_int, gather_idx, head_start, num_heads, dst_view
+                    )
+            if use_cuda:
+                scratch._gather_stream.synchronize()
+
+            transfer_blocks = []
+            scratch_ptr = scratch.get_ptr()
+            for (
+                _t,
+                dst_ptr,
+                dst_item_len,
+                dst_bytes_per_token,
+                _head_start,
+                _num_heads,
+                base,
+            ) in entries:
+                tokens_done = 0
+                for prefill_block, dst_block in zip(prefill_kv_blocks, dst_kv_blocks):
+                    block_pages = len(prefill_block)
+                    transfer_blocks.append(
+                        (
+                            scratch_ptr + base + tokens_done * dst_bytes_per_token,
+                            dst_ptr + int(dst_block[0]) * dst_item_len,
+                            block_pages * dst_item_len,
+                        )
+                    )
+                    tokens_done += block_pages * page_size
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -824,6 +1073,22 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         def process_sliced_entries() -> int:
+            if not sliced_layers_params:
+                return 0
+            # Prefer the gathered path (contiguous scratch, one descriptor
+            # per dst page run); it defers to the per-token loop below when
+            # tensor handles or the geometry do not line up.
+            gathered_status = self._send_sliced_entries_gathered(
+                mooncake_session_id,
+                sliced_layers_params,
+                prefill_data_indices,
+                prefill_kv_blocks,
+                dst_kv_blocks,
+                dst_tp_rank,
+                dst_attn_tp_size,
+            )
+            if gathered_status is not None:
+                return gathered_status
             for src_ptr, dst_ptr, src_item_len, dst_item_len in sliced_layers_params:
                 status = process_sliced_entry(
                     src_ptr, dst_ptr, src_item_len, dst_item_len

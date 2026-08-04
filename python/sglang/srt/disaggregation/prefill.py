@@ -269,6 +269,20 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Draft pool tensor refs enable the gathered sliced-send path for
+        # head-sharded draft entries (one descriptor per dst page run instead
+        # of one per token when the decode peer is head-sharded, e.g. a GQA
+        # DSPARK draft on a higher-attn-TP decode).
+        if (
+            self.draft_token_to_kv_pool is not None
+            and transfer_draft_cache
+            and hasattr(kv_manager, "set_draft_kv_buffer_tensors")
+        ):
+            draft_pool = self.draft_token_to_kv_pool
+            if hasattr(draft_pool, "k_buffer") and hasattr(draft_pool, "v_buffer"):
+                kv_manager.set_draft_kv_buffer_tensors(
+                    list(draft_pool.k_buffer) + list(draft_pool.v_buffer)
+                )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
