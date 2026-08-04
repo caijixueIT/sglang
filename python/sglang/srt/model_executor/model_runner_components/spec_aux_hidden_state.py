@@ -21,6 +21,10 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # Draft KV geometry, for exact per-stage KV budgeting under PP (the
+    # draft pool lives only on the last stage there).
+    dflash_draft_kv_heads: Optional[int] = None
+    dflash_draft_head_dim: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -163,3 +167,19 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        draft_hf = draft_model_config.hf_config
+        draft_kv_heads = getattr(draft_hf, "num_key_value_heads", None) or getattr(
+            draft_hf, "num_attention_heads", None
+        )
+        draft_head_dim = getattr(draft_hf, "head_dim", None)
+        if draft_head_dim is None:
+            hidden = getattr(draft_hf, "hidden_size", None)
+            n_heads = getattr(draft_hf, "num_attention_heads", None)
+            if hidden and n_heads:
+                draft_head_dim = int(hidden) // int(n_heads)
+        config.dflash_draft_kv_heads = (
+            int(draft_kv_heads) if draft_kv_heads else None
+        )
+        config.dflash_draft_head_dim = (
+            int(draft_head_dim) if draft_head_dim else None
+        )

@@ -73,6 +73,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _exact_dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
+    """Exact DFLASH/DSPARK draft-pool KV bytes per token on this rank.
+
+    K+V rows across all draft layers at this rank's attn-TP head shard, in
+    the draft pool's store dtype (the draft follows the target's
+    --kv-cache-dtype resolution). Returns 0 when the draft geometry is not
+    recorded, in which case the caller keeps the unscaled cell size.
+    """
+    draft_kv_heads = kvc.spec_aux_config.dflash_draft_kv_heads
+    draft_head_dim = kvc.spec_aux_config.dflash_draft_head_dim
+    draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
+    if not (draft_kv_heads and draft_head_dim and draft_num_layers):
+        logger.warning(
+            "Draft KV geometry unavailable (heads=%s head_dim=%s layers=%s); "
+            "the draft-hosting stage keeps the unscaled cell size and the "
+            "draft pool may over-allocate.",
+            draft_kv_heads,
+            draft_head_dim,
+            draft_num_layers,
+        )
+        return 0
+    attn_tp_size = max(get_parallel().attn_tp_size, 1)
+    heads_per_rank = max(int(draft_kv_heads) // attn_tp_size, 1)
+    elem_size = torch._utils._element_size(kvc.kv_cache_dtype)
+    return int(
+        2  # K and V buffers
+        * int(draft_num_layers)
+        * heads_per_rank
+        * int(draft_head_dim)
+        * elem_size
+    )
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -173,11 +206,40 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
-                )
+                if kvc.ps.pp_size > 1:
+                    # Under PP the draft pool lives ONLY on the last stage
+                    # (PD-prefill DSPARK), so the per-stage charge must be
+                    # exact: the "draft-per-layer == target-per-layer"
+                    # approximation below breaks down when a stage holds 1-2
+                    # MLA layers (~576B/token each) while the draft row is a
+                    # full-width GQA slab (all draft kv heads at attn TP 1).
+                    hosts_draft = (
+                        kvc.layer_info.end_layer
+                        == kvc.model_config.num_hidden_layers
+                    )
+                    draft_cell = (
+                        _exact_dflash_draft_cell_size(kvc) if hosts_draft else 0
+                    )
+                    if draft_cell > 0:
+                        self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                            target_cell_size_per_token=self._cell_size,
+                            target_num_layers=int(num_layers),
+                            draft_num_layers=int(draft_num_layers),
+                            draft_cell_size_per_token=draft_cell,
+                        )
+                        logger.info(
+                            "[pp-mem-solve] draft-hosting stage cell size: "
+                            "target=%dB + draft=%dB per token",
+                            self._cell_size - draft_cell,
+                            draft_cell,
+                        )
+                else:
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers)
+                        * kvc.server_args.dcp_size,
+                    )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
