@@ -1108,6 +1108,10 @@ class SchedulerPPMixin:
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=placeholder,
+            # Keep the disagg-prefill invariant `batch.spec_info is
+            # result.next_draft_input` on reconstructed results (a DSPARK PD
+            # prefill sets spec_info on the last rank; None elsewhere).
+            next_draft_input=batch.spec_info,
             can_run_cuda_graph=(
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
@@ -1147,6 +1151,10 @@ class SchedulerPPMixin:
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
+            # Keep the disagg-prefill invariant `batch.spec_info is
+            # result.next_draft_input` on reconstructed results (a DSPARK PD
+            # prefill sets spec_info on the last rank; None elsewhere).
+            next_draft_input=batch.spec_info,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,

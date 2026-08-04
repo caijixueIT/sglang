@@ -92,6 +92,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_graph_allowed = (
             not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
+        # PP-sharded PD prefill: only the LAST stage holds the draft (the fc
+        # projection consumes ALL capture layers' hidden states, which the PP
+        # proxy tensors relay downstream), injects the draft context KV and
+        # registers it for transfer. Every other stage is capture-only: it
+        # runs the target forward, relays its captured aux hiddens, and never
+        # builds a draft runner.
+        self._pp_capture_only = (
+            self._is_pd_prefill and ps.pp_size > 1 and ps.pp_rank != ps.pp_size - 1
+        )
         if (
             server_args.enable_dp_attention
             and self._draft_is_moe
@@ -102,6 +111,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
                 "MoE-under-DP all-reduce."
             )
+
+        if self._pp_capture_only:
+            self._init_pp_capture_only(server_args)
+            return
 
         with self._draft_context():
             bundle = build_draft_tp_worker(
@@ -114,6 +127,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                # The target worker already world-synced the seed; reusing it
+                # keeps the draft build collective-free, which is required
+                # when the draft exists on the last PP stage only.
+                synced_random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -268,6 +285,53 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+    def _init_pp_capture_only(self, server_args: ServerArgs) -> None:
+        """Minimal init for non-last PP stages of a PD prefill role.
+
+        These stages never build a draft runner: the target forward captures
+        their stage's aux hidden states and the PP proxy tensors relay them
+        to the last stage, which owns the draft model, the KV injection and
+        the draft-KV transfer registration.
+        """
+        from sglang.srt.configs.model_config import ModelConfig
+
+        self._draft_worker = None
+        self.draft_model_runner = None
+        self.draft_model = None
+        self._draft_sampler = None
+        self._verify_planner = None
+        self._kv_injector = None
+        self._proposer = None
+        self._verify_epilogue = None
+        self._verify_executor = None
+        self._observers = None
+        self._block_pos_offsets = None
+        self._draft_block_spec_info = None
+        self._simulate_acc_len = 0.0
+        self._forced_budget_frac = None
+        self._need_mamba_verify_commit = False
+
+        # gamma / verify window from the draft checkpoint config only (no
+        # weights, no runner) so scheduler-visible sizing attributes stay
+        # rank-uniform.
+        draft_model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=server_args.speculative_draft_model_path,
+            model_revision=server_args.speculative_draft_model_revision,
+            is_draft_model=True,
+        )
+        runtime_config = resolve_runtime_config(
+            draft_hf_config=draft_model_config.hf_config,
+            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            target_vocab_size=int(
+                self.target_worker.model_runner.model_config.vocab_size
+            ),
+        )
+        self.gamma = runtime_config.gamma
+        self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self.speculative_num_draft_tokens = self.verify_num_draft_tokens
+        self._mask_token_id = runtime_config.mask_token_id
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -275,10 +339,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        return self._verify_planner.carries_confidence
+        return (
+            self._verify_planner is not None
+            and self._verify_planner.carries_confidence
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if self.draft_model_runner is None:
+            # PP capture-only stage: no draft runner exists here.
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -300,6 +370,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if self._draft_worker is None:
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -307,6 +379,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if self._draft_worker is None:
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
@@ -317,6 +391,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._draft_worker is None:
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -363,25 +439,33 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
-        self._verify_planner.set_forced_budget_frac(frac)
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if self._observers is None:
+            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
-        self._observers.clear_info_records()
+        if self._observers is not None:
+            self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if self._observers is None:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self._observers is not None:
+            self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -389,14 +473,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            self._verify_planner.note_non_decode_step()
-            self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            if self._verify_planner is not None:
+                self._verify_planner.note_non_decode_step()
+            if self._observers is not None:
+                self._observers.note_prefill_step()
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
@@ -405,9 +491,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        fwd_kwargs = {}
+        if self.server_args.pp_size > 1:
+            fwd_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL, **fwd_kwargs
         )
+        if batch_output.pp_hidden_states_proxy_tensors is not None:
+            # Capture-only PP stage: the target forward already relayed this
+            # stage's aux hidden states inside the proxy tensors; injection
+            # and next_draft_input happen on the last stage.
+            assert self._pp_capture_only
+            return batch_output
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens

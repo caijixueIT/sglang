@@ -137,6 +137,11 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    # Per-KV-entry item lens on the decode side. Only differs from the src
+    # entry's item len for head-sharded (non-MLA) entries under heterogeneous
+    # attn TP -- e.g. a GQA speculative-draft pool paired with a TP1 prefill.
+    # Empty/None means every entry matches the src geometry (legacy peers).
+    dst_kv_item_lens_per_entry: Optional[List[int]] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -175,6 +180,11 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dst_kv_item_lens_per_entry=(
+                list(struct.unpack(f"{len(msg[18]) // 4}I", msg[18]))
+                if len(msg) > 18 and msg[18] != b""
+                else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
@@ -621,6 +631,9 @@ class MooncakeKVManager(CommonKVManager):
         force_flat: bool = False,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: int = 0,
+        dst_attn_tp_size: int = 1,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -629,6 +642,13 @@ class MooncakeKVManager(CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
+
+        ``dst_item_lens`` (parallel to ``dst_data_ptrs``) enables per-entry
+        mixed geometry on the layer-id path: entries whose decode item len
+        matches the source keep the whole-row copy; smaller decode entries are
+        head-sharded (e.g. a GQA speculative-draft pool registered by a
+        higher-attn-TP decode) and get a per-token sub-row slice addressed by
+        ``dst_tp_rank`` / ``dst_attn_tp_size``.
         """
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -636,6 +656,7 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         layers_params = None
+        sliced_layers_params: List[Tuple[int, int, int, int]] = []
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
@@ -649,9 +670,26 @@ class MooncakeKVManager(CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
-                layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
-                ]
+                layers_params = []
+                for i, j in pairs:
+                    dst_item_len = (
+                        dst_item_lens[j]
+                        if dst_item_lens and j < len(dst_item_lens)
+                        else item_lens[i]
+                    )
+                    if dst_item_len == item_lens[i]:
+                        layers_params.append(
+                            (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                        )
+                    else:
+                        sliced_layers_params.append(
+                            (
+                                src_data_ptrs[i],
+                                dst_data_ptrs[j],
+                                item_lens[i],
+                                dst_item_len,
+                            )
+                        )
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(
@@ -718,6 +756,82 @@ class MooncakeKVManager(CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
+        def process_sliced_entry(
+            src_ptr: int, dst_ptr: int, src_item_len: int, dst_item_len: int
+        ) -> int:
+            # Head-sharded (non-MLA) entry whose decode row is a per-rank head
+            # slice of the prefill row: send each token's sub-row to the slice
+            # this decode rank owns (QKVParallelLinear head partitioning).
+            page_size = self.kv_args.page_size
+            if (
+                dst_item_len > src_item_len
+                or src_item_len % dst_item_len != 0
+                or src_item_len % page_size != 0
+                or dst_item_len % page_size != 0
+            ):
+                logger.error(
+                    "Unsupported per-entry KV geometry for sliced transfer: "
+                    f"src_item_len={src_item_len}, dst_item_len={dst_item_len}, "
+                    f"page_size={page_size}"
+                )
+                return -1
+            if self.attn_tp_size > dst_attn_tp_size:
+                logger.error(
+                    "Per-entry sliced transfer only supports prefill attn TP <= "
+                    f"decode attn TP, got {self.attn_tp_size} > {dst_attn_tp_size}"
+                )
+                return -1
+            src_bytes_per_token = src_item_len // page_size
+            dst_bytes_per_token = dst_item_len // page_size
+            tp_ratio = max(dst_attn_tp_size // max(self.attn_tp_size, 1), 1)
+            byte_ratio = src_bytes_per_token // dst_bytes_per_token
+            # GQA replication: consecutive decode ranks share one KV head when
+            # the head count runs out before the TP degree does.
+            replication = max(1, tp_ratio // max(byte_ratio, 1))
+            local_dst_rank = (dst_tp_rank % dst_attn_tp_size) % tp_ratio
+            src_head_slice_offset = (
+                local_dst_rank // replication
+            ) * dst_bytes_per_token
+            if src_head_slice_offset + dst_bytes_per_token > src_bytes_per_token:
+                logger.error(
+                    "Sliced transfer head offset out of range: "
+                    f"offset={src_head_slice_offset}, "
+                    f"slice={dst_bytes_per_token}, row={src_bytes_per_token}"
+                )
+                return -1
+
+            src_pages = prefill_data_indices.reshape(-1, 1).astype(np.int64)
+            dst_pages = dst_data_indices.reshape(-1, 1).astype(np.int64)
+            tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+            src_addrs = (
+                src_ptr
+                + src_pages * src_item_len
+                + tokens_per_page * src_bytes_per_token
+                + src_head_slice_offset
+            ).reshape(-1)
+            dst_addrs = (
+                dst_ptr
+                + dst_pages * dst_item_len
+                + tokens_per_page * dst_bytes_per_token
+            ).reshape(-1)
+            if src_addrs.size == 0:
+                return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                [dst_bytes_per_token] * src_addrs.size,
+            )
+
+        def process_sliced_entries() -> int:
+            for src_ptr, dst_ptr, src_item_len, dst_item_len in sliced_layers_params:
+                status = process_sliced_entry(
+                    src_ptr, dst_ptr, src_item_len, dst_item_len
+                )
+                if status != 0:
+                    return status
+            return 0
+
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
@@ -734,11 +848,14 @@ class MooncakeKVManager(CommonKVManager):
                     for f in futures:
                         f.cancel()
                     return status
-            return 0
+            return process_sliced_entries()
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
-            return process_layers(layers_params)
+            status = process_layers(layers_params)
+            if status != 0:
+                return status
+            return process_sliced_entries()
 
     def send_kvcache(
         self,
@@ -748,6 +865,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: int = 0,
+        dst_attn_tp_size: int = 1,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -759,6 +879,9 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
+            dst_item_lens=dst_kv_item_lens,
+            dst_tp_rank=dst_tp_rank,
+            dst_attn_tp_size=dst_attn_tp_size,
         )
 
     def send_kvcache_dcp(
@@ -1604,6 +1727,13 @@ class MooncakeKVManager(CommonKVManager):
                                 chunked_dst_kv_indice,
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
+                                dst_kv_item_lens=(
+                                    target_rank_registration_info.dst_kv_item_lens_per_entry
+                                ),
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                dst_attn_tp_size=(
+                                    target_rank_registration_info.dst_attn_tp_size
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -2197,6 +2327,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
             dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
+            # Per-entry item lens: lets the prefill sender detect head-sharded
+            # (non-MLA) entries whose per-rank geometry differs from its own,
+            # e.g. a GQA speculative-draft pool at heterogeneous attn TP.
+            packed_kv_item_lens_per_entry = b"".join(
+                struct.pack("I", item_len)
+                for item_len in self.kv_mgr.kv_args.kv_item_lens
+            )
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2231,6 +2368,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_kv_item_lens_per_entry,
                         ]
                     )
             except zmq.ZMQError:

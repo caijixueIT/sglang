@@ -8532,9 +8532,33 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            # DSPARK on a PD-disaggregation PREFILL role is the one PP-safe
+            # speculative mode: it never runs the draft/verify decode loop
+            # there -- the target prefill forward only captures aux hidden
+            # states and injects the draft's context KV for transfer. All
+            # other spec algorithms (and DSPARK on colocated/decode roles)
+            # still drive a draft decode loop, which PP does not support.
+            pp_spec_allowed = self.speculative_algorithm is None or (
+                self.speculative_algorithm == "DSPARK"
+                and self.disaggregation_mode == "prefill"
+            )
+            assert self.disable_overlap_schedule and pp_spec_allowed, (
+                "Pipeline parallelism is not compatible with overlap schedule, "
+                "speculative decoding (except DSPARK on a disaggregation "
+                "prefill role)"
+            )
+            if (
+                self.speculative_algorithm == "DSPARK"
+                and self.disaggregation_mode == "prefill"
+                and self.disaggregation_transfer_backend != "mooncake"
+            ):
+                raise ValueError(
+                    "DSPARK on a PP-sharded disaggregation prefill requires "
+                    "--disaggregation-transfer-backend mooncake: only the "
+                    "mooncake sender implements the per-entry head-sliced "
+                    "draft KV transfer, got "
+                    f"{self.disaggregation_transfer_backend!r}."
+                )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

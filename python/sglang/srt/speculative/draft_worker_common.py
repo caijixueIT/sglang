@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -73,6 +74,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    synced_random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -90,24 +92,42 @@ def build_draft_tp_worker(
     # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
     # would silently skip those paths. context_length keeps the draft aligned
     # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
+    #
+    # ``synced_random_seed`` is the TARGET worker's world-synced seed. Passing
+    # it lets the draft TpModelWorker skip its own world-group seed broadcast,
+    # which is required when the draft worker exists on only a subset of the
+    # world (PP-prefill DSPARK builds the draft on the last stage only) and is
+    # a value-identical no-op otherwise.
+    #
+    # pp_size is forced to 1 for the same reason: the draft is never
+    # pipelined, and pp-conditional world collectives in the draft's config
+    # path (e.g. the KV token-capacity all_reduce in kv_cache_configurator)
+    # would deadlock when the draft exists on a single stage.
+    override_kwargs = dict(
         skip_tokenizer_init=True,
         speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
         decode_attention_backend=None,
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
+        pp_size=1,
     )
+    if synced_random_seed is not None:
+        override_kwargs["random_seed"] = synced_random_seed
+    draft_server_args.override("draft_worker.build", **override_kwargs)
 
     saved_server_args = get_server_args()
     try:
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
-            ps=ps,
+            # The draft model is never pipelined: it lives whole on whichever
+            # rank drives it, so its runner must not adopt the target's PP
+            # layout (layer partitioning, support_pp assert).
+            ps=replace(ps, pp_rank=0, pp_size=1),
             nccl_port=nccl_port,
             is_draft_worker=True,
+            skip_random_seed_sync=synced_random_seed is not None,
         )
     finally:
         get_context().set_server_args(saved_server_args)

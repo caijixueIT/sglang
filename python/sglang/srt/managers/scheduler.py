@@ -3481,24 +3481,38 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                spec_kwargs = {}
+                if self.ps.pp_size > 1:
+                    # Only reachable for DSPARK on a PD prefill role (the
+                    # server_args PP-x-spec assert allows nothing else): the
+                    # worker threads the proxy tensors through the target
+                    # forward so each stage can relay its captured aux
+                    # hidden states.
+                    spec_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **spec_kwargs
+                    )
+                if batch_result.pp_hidden_states_proxy_tensors is None:
+                    # The isolation restore reverted the worker's in-forward SB
+                    # edits; re-apply what must carry to the next iter. A
+                    # proxy-only result (non-last PP stage of a DSPARK PD
+                    # prefill) sampled and drafted nothing here -- the PP loop
+                    # just forwards the proxy tensors downstream.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    # Sync D2H so the result processor can read CPU tensors.
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

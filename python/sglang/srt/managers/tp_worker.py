@@ -285,6 +285,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        skip_random_seed_sync: bool = False,
     ):
         # Parse args
         self.server_args = server_args
@@ -300,6 +301,10 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: target's effective context length; the draft runs at
         # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
+        # Draft worker built on a subset of world ranks (PP-prefill DSPARK):
+        # server_args.random_seed already carries the target's world-synced
+        # seed, and joining the world-group seed broadcast would deadlock.
+        self.skip_random_seed_sync = skip_random_seed_sync
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -343,7 +348,7 @@ class TpModelWorker(BaseTpWorker):
 
         # Sync random seed across TP workers.
         # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        if server_args.is_ep_joiner or self.skip_random_seed_sync:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(

@@ -927,6 +927,71 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+def build_draft_kv_layer_ids(
+    draft_token_to_kv_pool,
+    num_kv_entries: int,
+    num_target_layers: int,
+) -> List[int]:
+    """Transfer-entry layer ids for a speculative draft KV pool.
+
+    Draft entries live in a namespace disjoint from the target's global layer
+    ids: draft layer ``j`` maps to ``num_target_layers + j``. Prefill and
+    decode compute this identically (same draft checkpoint and the same
+    target ``num_hidden_layers``), so PP-sharded prefill entries pair with
+    the decode's full list by id regardless of which stage holds the draft.
+
+    The id list mirrors ``get_contiguous_buf_infos`` entry order:
+    - MHA draft pools register ``[K_l0..K_ln, V_l0..V_ln]`` -> ids repeat as
+      ``[N+0..N+n, N+0..N+n]``.
+    - MLA-style draft pools register one entry per layer -> ``[N+0..N+n]``.
+    """
+    layer_num = getattr(draft_token_to_kv_pool, "layer_num", None)
+    if layer_num is None or layer_num <= 0 or num_kv_entries <= 0:
+        raise ValueError(
+            "Draft KV pool must expose a positive layer_num for PD layer-id "
+            f"pairing, got layer_num={layer_num}, entries={num_kv_entries}"
+        )
+    if num_kv_entries % layer_num != 0:
+        raise ValueError(
+            "Draft KV pool transfer entries must be a whole number of layer "
+            f"groups: entries={num_kv_entries}, layer_num={layer_num}"
+        )
+    groups = num_kv_entries // layer_num
+    per_layer_ids = [num_target_layers + j for j in range(layer_num)]
+    return per_layer_ids * groups
+
+
+def build_pd_kv_layer_ids(
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    num_target_kv_entries: int,
+    num_draft_kv_entries: int,
+    num_target_layers: int,
+) -> List[int]:
+    """Combined transfer-entry layer ids for target (+ optional draft) KV.
+
+    Returns ``[]`` (positional pairing) when the target pool does not expose
+    layer ids; PP-heterogeneous senders reject that combination downstream via
+    ``build_transfer_entry_pairs``. When a draft pool is present its entries
+    are appended in the ``build_draft_kv_layer_ids`` namespace so PP-sharded
+    prefill peers can pair with speculative-decoding decode peers by id
+    instead of dropping the metadata entirely.
+    """
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
+        return []
+    target_ids = list(token_to_kv_pool.get_kv_layer_ids())
+    if len(target_ids) != num_target_kv_entries:
+        raise ValueError(
+            "Target pool layer ids must match its transfer entries: "
+            f"ids={len(target_ids)}, entries={num_target_kv_entries}"
+        )
+    if draft_token_to_kv_pool is None:
+        return target_ids
+    return target_ids + build_draft_kv_layer_ids(
+        draft_token_to_kv_pool, num_draft_kv_entries, num_target_layers
+    )
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,

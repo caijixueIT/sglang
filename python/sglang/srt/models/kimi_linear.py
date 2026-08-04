@@ -539,7 +539,11 @@ class KimiLinearModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        # Stage-local subset of the capture layers (this rank's layers only).
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # Full capture list in draft-layer order; the last PP rank uses it to
+        # assemble upstream (proxy-relayed) + local aux hidden states.
+        self.dspark_all_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -623,12 +627,27 @@ class KimiLinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if self.dspark_all_layers_to_capture is not None:
+                # Relay every capture layer produced so far (upstream stages'
+                # plus this stage's) so the last rank can assemble the full
+                # aux list for the DSPARK draft-KV injection.
+                local = dict(
+                    zip(self.dspark_layers_to_capture or [], aux_hidden_states)
+                )
+                for layer_id in self.dspark_all_layers_to_capture:
+                    key = f"dspark_aux_{layer_id}"
+                    if layer_id in local:
+                        proxy[key] = local[layer_id]
+                    elif (
+                        pp_proxy_tensors is not None
+                        and key in pp_proxy_tensors.tensors
+                    ):
+                        proxy[key] = pp_proxy_tensors[key]
+            return PPProxyTensors(proxy)
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
@@ -637,6 +656,28 @@ class KimiLinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
+            if (
+                self.dspark_all_layers_to_capture is not None
+                and self.pp_group.world_size > 1
+            ):
+                # Merge upstream (proxy-relayed) captures with this stage's,
+                # in draft-layer (capture-list) order.
+                local = dict(zip(self.dspark_layers_to_capture, aux_hidden_states))
+                merged = []
+                for layer_id in self.dspark_all_layers_to_capture:
+                    if layer_id in local:
+                        merged.append(local[layer_id])
+                    else:
+                        key = f"dspark_aux_{layer_id}"
+                        assert (
+                            pp_proxy_tensors is not None
+                            and key in pp_proxy_tensors.tensors
+                        ), (
+                            "DSPARK aux hidden capture under PP expected the "
+                            f"proxy tensors to relay layer {layer_id}"
+                        )
+                        merged.append(pp_proxy_tensors[key])
+                aux_hidden_states = merged
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -674,16 +715,21 @@ class KimiLinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        # Under PP each stage captures its own subset of the target layers and
+        # relays them downstream via the PP proxy tensors; the last rank
+        # assembles the full list in capture order (see KimiLinearModel.forward).
+        # DSPARK on PP is only reachable on a PD-disaggregation prefill role
+        # (server_args gates the combination).
+        local_layer_ids = [
+            l for l in layer_ids if self.model.start_layer <= l < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
+        self.model.dspark_all_layers_to_capture = list(layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids
 
     @torch.no_grad()
     def forward(

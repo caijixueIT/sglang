@@ -66,7 +66,13 @@ def get_draft_kv_pool(
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
-        draft_runner = draft_worker.draft_worker.draft_runner
+        # PP-prefill DSPARK capture-only stages (every stage but the last)
+        # carry no draft runner: only the last stage injects and transfers
+        # the draft context KV.
+        inner_draft_worker = draft_worker.draft_worker
+        if inner_draft_worker is None:
+            return None
+        draft_runner = inner_draft_worker.draft_runner
     return draft_runner.token_to_kv_pool
 
 

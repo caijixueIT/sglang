@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_pd_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -209,21 +210,28 @@ class PrefillBootstrapQueue:
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
+            num_target_kv_entries = len(kv_data_ptrs)
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+        else:
+            num_target_kv_entries = len(kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        # Draft entries get ids in the num_hidden_layers+j namespace so a
+        # PP-sharded prefill still pairs by layer id with a speculative decode
+        # peer instead of falling back to (PP-incompatible) positional pairing.
+        kv_args.kv_layer_ids = build_pd_kv_layer_ids(
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool if transfer_draft_cache else None,
+            num_target_kv_entries,
+            len(kv_data_ptrs) - num_target_kv_entries,
+            self.scheduler.model_config.num_hidden_layers,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
