@@ -1595,8 +1595,25 @@ class KVCacheConfigurator:
                 / 1024,
             )
         rest_memory = available_gpu_memory - slack_gb
+        if self.server_args.pp_size > 1:
+            # Diagnostic for PP memory solves (values are rank-local except
+            # available, which is the world MIN).
+            logger.info(
+                "[pp-mem-solve] available=%.2fGB pre=%.2fGB slack=%.2fGB "
+                "rest_before_mamba=%.2fGB mem_frac=%s post_capture=%s",
+                available_gpu_memory,
+                pre_model_load_memory,
+                slack_gb,
+                rest_memory,
+                self.server_args.mem_fraction_static,
+                self.post_capture_kv_active,
+            )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+            if self.server_args.pp_size > 1:
+                logger.info(
+                    "[pp-mem-solve] rest_after_mamba=%.2fGB", rest_memory
+                )
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
@@ -1830,6 +1847,15 @@ class KVCacheConfigurator:
             _share = max(int(_n.item()), 1) / _total_kda
             per_req_budget = max(int(per_req_budget * _share), 1)
             replayssm_ring_per_req = int(replayssm_ring_per_req * _share)
+            logger.info(
+                "[pp-mem-solve] mamba share: local_kda=%d max_stage_kda=%d "
+                "total_kda=%d share=%.4f per_req_budget=%.1fMB",
+                _local_kda,
+                int(_n.item()),
+                _total_kda,
+                _share,
+                per_req_budget / (1 << 20),
+            )
 
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
@@ -1857,6 +1883,18 @@ class KVCacheConfigurator:
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                if server_args.pp_size > 1:
+                    logger.info(
+                        "[pp-mem-solve] mamba explicit-slot spec charge: "
+                        "slots=%d ratio=%s capped_reqs=%d D=%d "
+                        "intermediate=%.2fGB rest_now=%.2fGB",
+                        server_args.max_mamba_cache_size,
+                        ratio,
+                        capped_reqs,
+                        server_args.speculative_num_draft_tokens,
+                        intermediate_size / (1 << 30),
+                        total_rest_memory,
+                    )
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -1943,6 +1981,15 @@ class KVCacheConfigurator:
             * (per_req_budget + replayssm_ring_per_req)
             / (1 << 30)
         )
+        if server_args.pp_size > 1:
+            logger.info(
+                "[pp-mem-solve] mamba main state: slots=%d per_slot=%.1fMB "
+                "state_memory=%.2fGB rest_after=%.2fGB",
+                server_args.max_mamba_cache_size,
+                (per_req_budget + replayssm_ring_per_req) / (1 << 20),
+                mamba_state_memory,
+                total_rest_memory - mamba_state_memory,
+            )
         return total_rest_memory - mamba_state_memory
 
 
