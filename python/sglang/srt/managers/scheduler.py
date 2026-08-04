@@ -3507,12 +3507,17 @@ class Scheduler(
                             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     self.update_cache_from_scheduler(batch, batch_result)
-                    # Sync D2H so the result processor can read CPU tensors.
-                    batch_result.copy_done = self.device_module.Event()
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
+                    if self.ps.pp_size == 1:
+                        # Sync D2H so the result processor can read CPU tensors.
+                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
+                    # Under PP the loop relays next_token_ids through the PP
+                    # output tensors, which must stay device-resident (the
+                    # relay stashes them back into the GPU future map); the
+                    # PP loop records its own d2h_event for the processor.
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
