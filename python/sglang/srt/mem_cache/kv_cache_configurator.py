@@ -1800,6 +1800,37 @@ class KVCacheConfigurator:
             if replayssm_active
             else 0
         )
+        # KIMI_K3_PP_MAMBA_BUDGET_FIX: mamba_cache_per_req counts every KDA
+        # layer in the model, but each PP stage only allocates the state for
+        # its own layers (see the mamba_layer_ids filtering in the pool
+        # builders). Charging the budget at full-model bytes over-reserves
+        # pp_size-fold: on Kimi-K3 PP16 that pinned ~50GB per GPU as
+        # reserved-but-never-allocated and capped the slot solve at ~120
+        # while ~70GB sat idle. Charge the largest stage's share instead --
+        # max_mamba_cache_size must agree across ranks (slot indices are
+        # shared), and total_rest_memory is already the cross-rank minimum,
+        # so the MAX share is uniform and safe on every rank.
+        per_req_budget = config.mamba2_cache_params.mamba_cache_per_req
+        if server_args.pp_size > 1:
+            import torch.distributed as _dist
+
+            _params = config.mamba2_cache_params
+            _total_kda = max(len(_params.layers), 1)
+            _local_kda = len(
+                [
+                    i
+                    for i in _params.layers
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ]
+            )
+            _n = torch.tensor(_local_kda, dtype=torch.int64)
+            _dist.all_reduce(
+                _n, op=_dist.ReduceOp.MAX, group=get_world_group().cpu_group
+            )
+            _share = max(int(_n.item()), 1) / _total_kda
+            per_req_budget = max(int(per_req_budget * _share), 1)
+            replayssm_ring_per_req = int(replayssm_ring_per_req * _share)
+
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -1821,7 +1852,7 @@ class KVCacheConfigurator:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    per_req_budget
                     * (capped_reqs + 1)
                     * server_args.speculative_num_draft_tokens
                 )
@@ -1840,15 +1871,15 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    per_req_budget
                     * (server_args.max_mamba_cache_size + 1)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert per_req_budget > 0
+            per_req = per_req_budget
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
@@ -1897,7 +1928,7 @@ class KVCacheConfigurator:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"mamba_cache_per_req={per_req_budget / (1 << 20):.2f} MB). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
@@ -1909,7 +1940,7 @@ class KVCacheConfigurator:
         # the ring is not allocated).
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
-            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
+            * (per_req_budget + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
