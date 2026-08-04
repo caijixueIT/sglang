@@ -300,9 +300,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size != 1:
+    if server_args.pp_size != 1 and server_args.disaggregation_mode != "prefill":
+        # A PD-disaggregation PREFILL role is the one PP-safe DSpark mode: it
+        # never runs the draft/verify decode loop -- the target prefill
+        # forward only captures aux hidden states and injects the draft's
+        # context KV for transfer (see the matching pp_spec_allowed gate in
+        # ServerArgs' pipeline-parallelism validation).
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "Currently DSpark speculative decoding only supports pp_size == 1 "
+            "(except on a PD-disaggregation prefill role)."
         )
 
     if server_args.speculative_draft_model_path is None:
