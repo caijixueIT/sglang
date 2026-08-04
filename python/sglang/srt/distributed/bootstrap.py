@@ -105,10 +105,17 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+    # Draft workers must not join the world-group MIN here: a draft can be
+    # built on a subset of ranks (PP-prefill DSPARK builds it on the last
+    # stage only), and an extra world collective from that subset pairs up
+    # with unrelated collectives on the other ranks (observed live: PP0's
+    # mamba-budget MAX all_reduce receiving a free-memory byte count). Draft
+    # workers never consume the cross-rank minimum anyway -- their KV-pool
+    # solve is skipped in favor of the target's resolved MemoryPoolConfig.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=(not is_draft_worker) and get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()
